@@ -32,6 +32,15 @@ readonly TRACKER_REPO=${OP_TRACKER_REPO}
 # Asks for REQUESTER: a question, a PR to review, or a chore.
 readonly ASK_LABELS='["question", "review", "chore"]'
 readonly COMMENT_REASON=comment
+# Commands for another responder sharing the bot account (e.g. botd's
+# "@BOT claude <request>" at the start of a line): a mention that is only
+# such a command line is that responder's, not an ask for this harness.
+# Space-separated command words, from $BOT_NOTIFY_SKIP_COMMANDS.
+read -r -a SKIP_COMMANDS <<<"${BOT_NOTIFY_SKIP_COMMANDS:-}"
+SKIP_RE=''
+if test "${#SKIP_COMMANDS[@]}" -gt 0; then
+    SKIP_RE="(^|\n)[ \t]*@${BOT_LOGIN}[ \t]+($(IFS='|'; echo "${SKIP_COMMANDS[*]}"))(?![A-Za-z0-9_-])[^\n]*"
+fi
 # REQUESTER's notes for the bot (the review app's capture bar files
 # them): an open TRACKER_REPO issue he opened that carries TRIAGE_LABEL
 # hasn't been triaged yet. Each time it gets the label is one request,
@@ -783,7 +792,10 @@ triggers() {
                     fi
                 ) || return 1
                 found=$(jq -c --arg lr "${last_read}" --arg re "${pattern}" --argjson self "${self}" --arg bot "${BOT_LOGIN}" \
-                    'select(($lr == "" or .at > $lr) and (.body // "" | test($re; "i")) and ($self or .author != $bot))
+                    --arg skip "${SKIP_RE}" \
+                    'select(($lr == "" or .at > $lr)
+                        and (.body // "" | if $skip == "" then . else gsub($skip; "\n"; "i") end | test($re; "i"))
+                        and ($self or .author != $bot))
                      | del(.at) + {located: true}' <<<"${candidates}")
                 ;;
             "${COMMENT_REASON}")
@@ -814,8 +826,9 @@ triggers() {
                 ) || return 1
                 found=$(jq -c --arg lr "${lr}" --argjson own "${own}" --arg bot "${BOT_LOGIN}" \
                     --arg re "@${BOT_LOGIN}(?![A-Za-z0-9-])" --argjson peers "${COORDINATION_LOGINS}" \
+                    --arg skip "${SKIP_RE}" \
                     'select(.at > $lr and ($own or .author != $bot)
-                        and ((.body // "" | test($re; "i")) or (.opened and .author_type == "User" and (.author | IN($peers[])))))
+                        and ((.body // "" | if $skip == "" then . else gsub($skip; "\n"; "i") end | test($re; "i")) or (.opened and .author_type == "User" and (.author | IN($peers[])))))
                      | del(.at, .opened) + {located: true}' <<<"${candidates}")
                 test -n "${found}" || return 0
                 ;;
