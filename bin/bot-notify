@@ -806,8 +806,9 @@ triggers() {
                 trusted_json=$(printf '%s\n' "${trusted[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
                 found=$(ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100${last_read:+&since=${last_read}}" \
                     --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .created_at}' |
-                    jq -c --arg lr "${last_read}" --argjson trusted "${trusted_json}" \
-                        'select(($lr == "" or .at > $lr) and .author_type == "User" and (.author | IN($trusted[])))
+                    jq -c --arg lr "${last_read}" --argjson trusted "${trusted_json}" --arg skip "${SKIP_RE}" \
+                        'select(($lr == "" or .at > $lr) and .author_type == "User" and (.author | IN($trusted[]))
+                            and ($skip == "" or (.body // "" | gsub($skip; "\n"; "i") | test("\\S"))))
                          | del(.at) + {located: true}') || return 1
                 test -n "${found}" || return 0
                 ;;
