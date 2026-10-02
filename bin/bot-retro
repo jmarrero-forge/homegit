@@ -16,11 +16,12 @@ const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
 const SCHEMA = "bot-retro-summary/v1";
 const DEFAULT_SINCE = "24h";
 const HOME = os.homedir();
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
 // Where Claude Code keeps the transcripts of sessions started in the
 // directory holding the bot's clones.
-const DEFAULT_PROJECTS = path.join(HOME, ".claude", "projects", path.join(HOME, "src/github/cgwalters-bot").replace(/[/.]/g, "-"));
 // The shared clones: git work that changes a checkout belongs in a worktree.
-const SHARED_CLONES = path.join(HOME, "src/github/cgwalters-bot");
+const SHARED_CLONES = path.join(HOME, "src/github", CONFIG.bot.login);
+const DEFAULT_PROJECTS = path.join(HOME, ".claude", "projects", SHARED_CLONES.replace(/[/.]/g, "-"));
 const QUOTE_MAX = 120;
 const EXAMPLES_MAX = 5;
 const LONG_TOOL_S = 10 * 60;
@@ -78,7 +79,7 @@ AGE is like 12h, 7d or 2w, or a date (default ${DEFAULT_SINCE}); DATE is a date
   --gist               post the report as a secret gist and print its URL
   --issues N           open the top N (at most ${PROPOSALS_MAX}) proposals as issues in
                        the tracker repository, on the board with no Status
-                       (P1, Org cgwalters-bot)
+                       (P1, Org ${CONFIG.bot.login})
 `;
 }
 
@@ -678,7 +679,7 @@ const PROPOSALS = {
   local_build: ["Stop local builds by worker agents", "Workers ran compiles or tests on the coordinator machine despite the devspace-only rule. Consider a Bash PreToolUse hook that refuses cargo/make/podman build outside ssh/bot-devspace."],
   fixup_push: ["Refuse pushes that carry fixup! commits", "Agents pushed with a fixup/squash commit pending. bot-git check catches it before bot-land; make every push path (bot-pr fork-pr, plain git push) run it."],
   signoff: ["Keep agents from adding Signed-off-by", "Agents used --signoff or wrote a Signed-off-by trailer by hand. bot-git refuses on commit; look at which paths bypass it."],
-  shared_clone: ["Keep git work out of the shared clones", "Agents ran branch-changing git commands in a shared clone under ~/src/github/cgwalters-bot instead of their own worktree. A guard in bot-git (refuse outside a worktree) would catch it."],
+  shared_clone: ["Keep git work out of the shared clones", `Agents ran branch-changing git commands in a shared clone under ~/src/github/${CONFIG.bot.login} instead of their own worktree. A guard in bot-git (refuse outside a worktree) would catch it.`],
   injection_flagged: ["Review subagent output the harness flagged as instruction-shaped", "The harness flagged subagent results as instruction-shaped (e.g. permission-bypass wording). Check whether any came from GitHub text, and whether worker reports should avoid quoting it."],
   injection_text: ["Check possible prompt-injection text seen by agents", "Text from GitHub or the web that reads like instructions reached agents' tool results."],
   blocked_sleep: ["Give workers a wait helper instead of sleep polling", "The harness blocked many long sleep commands, each a wasted turn. Document Monitor/until-loops (or add a bot-wait helper) in the worker preamble."],
@@ -876,7 +877,7 @@ function fileIssues(proposals, n, gist) {
     const body = `${p.body}\n\nFrom the agent retro (bot-retro).`;
     const board = (args) => execFileSync(BOT_BOARD, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
     try {
-      const id = board(["issue", "--org", "cgwalters-bot", p.title, body]);
+      const id = board(["issue", "--org", CONFIG.bot.login, p.title, body]);
       board(["set", id, "--priority", "P1", ...(gist ? ["--gist", gist] : [])]);
       ids.push({ id, title: p.title });
     } catch (e) {

@@ -26,7 +26,8 @@ const GH = process.env.BOT_COST_GH || "gh";
 const BOT_RUNS = process.env.BOT_COST_BOT_RUNS || path.join(BIN_DIR, "bot-runs");
 // The repositories whose Actions runs are the bot's compute: the devspace
 // repository and the bot's fork of it, where agent.yml runs.
-const DEFAULT_REPOS = ["bootc-dev/cgwalters-devspace-sandbox", "cgwalters-bot/cgwalters-devspace-sandbox"];
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
+const DEFAULT_REPOS = [CONFIG.devspace.repo, `${CONFIG.bot.login}/${CONFIG.devspace.repo.split("/")[1]}`];
 const AGENT_WORKFLOW = "agent.yml";
 const PER_PAGE = 100;
 const API_CONCURRENCY = 8;
@@ -338,7 +339,16 @@ function computeOf(repo, run, jobs, win) {
 async function scanCompute(opts, win, notes) {
   const records = [];
   for (const repo of opts.repos) {
-    const runs = (await listRuns(repo, win.since - RUN_LOOKBACK_S * 1000, win.until)).filter((r) => {
+    let listed;
+    try {
+      listed = await listRuns(repo, win.since - RUN_LOOKBACK_S * 1000, win.until);
+    } catch (e) {
+      // The default bot fork (for agent.yml runs) needn't exist.
+      if (!(e instanceof Exit) || !/Not Found \(HTTP 404\)/.test(e.message)) throw e;
+      notes.push(`${repo} does not exist (or isn't visible), so it was skipped.`);
+      continue;
+    }
+    const runs = listed.filter((r) => {
       const start = Date.parse(r.run_started_at || r.created_at);
       return start < win.until && (r.status !== "completed" || Date.parse(r.updated_at) > win.since);
     });
