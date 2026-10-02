@@ -284,7 +284,8 @@ be a question for maintainers), ask with `bot-board question`.
   verdict first, evidence-backed (links, and test results with where they
   ran), with long analysis in a linked gist (see "Upstream-facing text" in
   the shared AGENTS.md), ending
-  with `Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`). Post one reply
+  with `Generated-by: URL`, URL being the config's `generated_by_url`
+  (get it with `bot-operator get generated_by_url`). Post one reply
   per ask, in the same thread (a review-comment reply if they asked in a
   review comment, otherwise an issue/PR comment). No other upstream actions
   follow from the tag: no pushing to others' branches, reviews, approvals,
@@ -536,7 +537,8 @@ below.
   PR, both with `bot-pr fork-pr`, run in the clone that has the branch. Write its title and body as the upstream PR they will become (see
   `upstream-pr`): why, what was tested and where, caveats (e.g. someone
   else's commit without their DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
-  `Generated-by: https://github.com/cgwalters/#llms` line (the config's `generated_by_url`) last. `fork-pr`
+  `Generated-by: URL` line last, URL being the config's `generated_by_url`
+  (get it with `bot-operator get generated_by_url`). `fork-pr`
   appends the bot-meta section (upstream target, board item, and how to
   approve) and prints the fork PR URL. It creates the fork the first time,
   keeps every workflow there disabled (unless one is opted in with `--ci`),

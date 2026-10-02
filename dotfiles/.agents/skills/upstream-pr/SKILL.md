@@ -293,10 +293,11 @@ a brief what and why, how it was tested, the
 change, the issue link
 (`Fixes OWNER/REPO#N` when it fully resolves it) and caveats (such as
 someone else's commits that still need their DCO sign-off). It follows any PR
-template and ends with the config's `generated_by_url`:
+template and ends with the config's `generated_by_url`
+(get it with `bot-operator get generated_by_url`):
 
 ```
-Generated-by: https://github.com/cgwalters/#llms
+Generated-by: $(bot-operator get generated_by_url)
 ```
 
 ## Open the upstream PR

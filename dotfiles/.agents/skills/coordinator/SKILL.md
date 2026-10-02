@@ -631,7 +631,7 @@ summary of it:
   `bot-capacity` report (projected percent at reset, what was held back).
 
 Keep it scannable, and end it with
-`Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`).
+`Generated-by: URL`, URL being the config's `generated_by_url` (get it with `bot-operator get generated_by_url`).
 
 ## Stopping
 
