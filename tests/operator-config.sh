@@ -180,7 +180,10 @@ grep -q 'repos/jmarrero-bot/jmarrero-devspace-sandbox/actions/runs/42' "${FAKE}/
     fail "devspace-list: didn't read the run in jmarrero-bot/jmarrero-devspace-sandbox: $(cat "${FAKE}/calls")"
 
 # --- Nothing of the default config anywhere ---
-if leaks=$(grep -ris "${LEAK}" "${WORK}/out" "${FAKE}/calls" "${FAKE}/input"); then
+# Except the coordination channel with cgwalters' harness, which jmarrero's
+# config (this one) has on purpose: the repository and its peer logins.
+if leaks=$(grep -ris "${LEAK}" "${WORK}/out" "${FAKE}/calls" "${FAKE}/input" |
+    grep -v -e 'cgwalters-forge/harness-coordination' -e 'by cgwalters-bot or cgwalters'); then
     fail "'${LEAK}' leaked under another operator's config: ${leaks}"
 fi
 
