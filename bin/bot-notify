@@ -59,12 +59,15 @@ readonly TRIAGE_REASON=triage
 # REQUESTER, a request as anywhere; by anyone else, filed like a mention.
 # The rest (people talking to each other, the bot's own) is left alone.
 # Those logins count nowhere else.
-# It is the default config's channel with jmarrero's harness; under
-# another operator config there is none (COORDINATION_REPO is empty and
-# no login is a peer).
+# It is the channel between cgwalters' harness and jmarrero's, the same
+# repository from both sides; under any other operator config there is
+# none (COORDINATION_REPO is empty and no login is a peer).
 if test "${FORGE_ORG}" = cgwalters-forge; then
     readonly COORDINATION_REPO=${FORGE_ORG}/harness-coordination
     readonly COORDINATION_LOGINS='["jmarrero-bot", "jmarrero"]'
+elif test "${FORGE_ORG}" = jmarrero-forge; then
+    readonly COORDINATION_REPO=cgwalters-forge/harness-coordination
+    readonly COORDINATION_LOGINS='["cgwalters-bot", "cgwalters"]'
 else
     readonly COORDINATION_REPO=""
     readonly COORDINATION_LOGINS='[]'
