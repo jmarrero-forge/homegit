@@ -26,7 +26,7 @@ sources:
     sha: 62a5861815eb4e5a267bd54a0354bab5f3f0af2c
   - repo: bootc-dev/bootc
     path: CONTRIBUTING.md
-    sha: 4d8b5e6ea16b0a427921acc737a815cb1edecf02
+    sha: 298b76cf4d9f07c33cf6b9084ed689ef2a6e7cde
   - repo: bootc-dev/bootc
     path: GOVERNANCE.md
     sha: 13e8ab007ade5e6b7f5412d12360d4f0f9b4707c
@@ -34,8 +34,17 @@ sources:
     path: MAINTAINERS.md
     sha: f0b9f94dd5b2a34b55f2cd17a079a47ac94f60b1
   - repo: bootc-dev/bootc
+    path: README.md
+    sha: 7f6f708be0dca49384f2e91d4a8b67a0600ee145
+  - repo: bootc-dev/bootc
     path: REVIEW.md
     sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
+  - repo: bootc-dev/bootc
+    path: REVIEW_GOLANG.md
+    sha: 11993395d60a99bd907bb42ef4e8ba69a83080d5
+  - repo: bootc-dev/bootc
+    path: REVIEW_RUST.md
+    sha: ac7983b541797fe01d8d2eb8427a0aac5fa4e6bd
   - repo: bootc-dev/bootc
     path: SECURITY.md
     sha: 04944bb6565f77012476876cf66f68f8f04234f0
@@ -45,7 +54,7 @@ sources:
   - repo: bootc-dev/infra
     path: common/REVIEW.md
     sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
-checked: 2026-09-29 by the policy-check subagent (coordinator session 929c7a64, re-read after CONTRIBUTING.md changed)
+checked: 2026-10-13 by the policy-check subagent (coordinator session b32c91a0, re-read after CONTRIBUTING.md changed)
 rebase: any
 ---
 
@@ -53,8 +62,11 @@ rebase: any
 bootc-dev/infra `common/` files (the latter two are symlinks to AGENTS.md);
 `.gemini/config.yaml` only tunes Gemini code review, and
 `.github/agents/agentic-workflows.md` is a gh-aw helper for editing workflows,
-with nothing on contributions. GOVERNANCE.md, MAINTAINERS.md,
-CODE_OF_CONDUCT.md and SECURITY.md have nothing on AI, bots or sign-off.
+with nothing on contributions. REVIEW_RUST.md and REVIEW_GOLANG.md (linked
+from AGENTS.md) are language-specific code guidance with nothing on AI or
+attribution; README.md only points to CONTRIBUTING.md, MAINTAINERS.md and
+the code of conduct. GOVERNANCE.md, MAINTAINERS.md, CODE_OF_CONDUCT.md and
+SECURITY.md have nothing on AI, bots or sign-off.
 
 ## Quotes
 
@@ -100,10 +112,24 @@ CODE_OF_CONDUCT.md and SECURITY.md have nothing on AI, bots or sign-off.
 
 > "The podman project has some [generic useful guidance](https://github.com/containers/podman/blob/main/CONTRIBUTING.md#submitting-pull-requests);
 > like that project, a "Developer Certificate of Origin" is required."
-> — bootc-dev/bootc CONTRIBUTING.md (4d8b5e6ea16b), "Submitting a patch"
+> — bootc-dev/bootc CONTRIBUTING.md (298b76cf4d9f), "Submitting a patch"
 
 > "You may use `Signed-off-by`, but we're not requiring it."
-> — bootc-dev/bootc CONTRIBUTING.md (4d8b5e6ea16b), "Git commit style"
+> — bootc-dev/bootc CONTRIBUTING.md (298b76cf4d9f), "Git commit style"
+
+> "If the agent is performing a review of other's code, the same
+> principles apply."
+> — bootc-dev/bootc AGENTS.md (61261301421a), "Code guidelines"
+
+> "This applies equally when an AI tool (e.g. Gemini, Copilot) suggests a
+> change via a review comment — applying the suggestion creates a new commit
+> with an auto-generated subject. That commit should be squashed before the
+> PR is merged."
+> — bootc-dev/bootc REVIEW.md (3068dd57b2c3), "Further changes on top of existing commits"
+
+> "Direct pushes to the code is never allowed. All pull requests require review by a maintainer
+> *other* than the one submitting it."
+> — bootc-dev/bootc GOVERNANCE.md (13e8ab007ade), "Maintainers"
 
 CONTRIBUTING.md contradicts itself on DCO; the org ruleset requiring the DCO
 check settles it (and promote decides DCO live anyway).
@@ -116,8 +142,10 @@ repositories by infra's `sync-common` workflow) is written for AI agents: it
 expects AI-generated commits and PR text, asks for an `Assisted-by: AI` or
 `Generated-by: AI` trailer, and requires a human to review the code and the
 commit message text and to add the `Signed-off-by` himself. Nothing requires
-the human to write the text, so this is bot-ok; cgwalters' review of the fork
-PR and his sign-off at promote are what the policy asks for. Diffs over ~500
+the human to write the text, so this is bot-ok; the operator's review of the
+fork PR and their sign-off at promote are what the policy asks for, and
+GOVERNANCE.md still wants a maintainer other than the submitter to review
+the upstream PR. Diffs over ~500
 substantial lines want a design issue first.
 
 The sources disagree on the trailer's content: AGENTS.md says "do NOT
@@ -127,6 +155,22 @@ agent-specific rule in its "CRITICAL instructions" section, so the bot uses the
 generic `Assisted-by: AI` (substantial assistance) or `Generated-by: AI`
 (effectively entirely generated); the bot's default `Generated-by: AI` fits
 work it wrote end to end.
+
+## Review comments
+
+The bot may post review comments on bootc PRs carrying AI-drafted findings
+the operator (jmarrero, an Approver in MAINTAINERS.md) wrote or asked for.
+AGENTS.md expects agents to review others' code under the same principles,
+REVIEW.md treats review comments from AI tools as normal, and the repository
+runs Gemini code review on every PR (`.gemini/config.yaml`). No source sets
+a disclosure for review comments: the `Assisted-by: AI` / `Generated-by: AI`
+trailers are for commits and the "level of review" note for PR descriptions.
+The bot account already marks the comments as automated; a short line in
+that vocabulary (e.g. "Generated-by: AI, at jmarrero's request") keeps them
+consistent with it, without naming a model or tool, as AGENTS.md asks. The
+bot's review is not the maintainer review GOVERNANCE.md requires, so it
+comments rather than approving or requesting changes; jmarrero approves
+from his own account.
 
 ## Rebasing
 
