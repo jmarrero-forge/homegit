@@ -48,6 +48,10 @@ const MAX_CLASSIFY_PER_RUN = 20;
 // to look at, so that one bad event can't hold the cursor forever.
 const MAX_CLASSIFY_ATTEMPTS = 3;
 const CLASSIFY_TIMEOUT_MS = 120 * 1000;
+// Said when the classifier's failure looks like a missing login.
+const LOGIN_RE = /log ?in|auth/i;
+const LOGIN_HINT = "no Claude login in this environment: CLAUDE_CODE_OAUTH_TOKEN missing? Claude Code strips it "
+  + `from its tool shells; run under bot-poll from the entrypoint, or set ${CLASSIFIER_ENV}`;
 const ACTIONS = ["none", "act", "ask"];
 const KINDS = ["review-feedback", "answer", "request", "fyi"];
 // An issue's or PR's web or API URL, for its repository and number.
@@ -87,7 +91,11 @@ or none. Each act or ask is listed for ${LIST_MS / DAY_MS} days, one line per ev
 "KIND ACTION URL: SUMMARY".
 A classification that fails is retried on the next run (the cursor waits
 for it, and the run exits 1); after ${MAX_CLASSIFY_ATTEMPTS} failed runs the event is listed as an
-ask for a human instead.
+ask for a human instead. When the classifier itself fails (it can't
+run, exits nonzero, times out, prints no JSON or reports an error, e.g.
+for a missing login), it is tried once on a canned event: if that works,
+the failure counts as the event's; if it fails too, the run counts no
+attempt, stops classifying and exits 1, and the next run retries.
 
 The cursor, the seen events and the decisions are kept in
 ${STATE_DIR}, and so is repos.json: each event of theirs
@@ -322,10 +330,36 @@ function parseDecision(text) {
   return { action: d.action, kind: d.kind, summary: excerpt(d.summary.split("\n")[0]).slice(0, 160), confidence: conf };
 }
 
-async function classify(ev, ctxData) {
-  const input = `<untrusted>\n${JSON.stringify({ event: {
-    type: ev.type, action: ev.action, repo: ev.repo, number: ev.number, url: ev.url, at: ev.time, by: OPERATOR, text: excerpt(ev.body),
-  }, context: ctxData }, null, 1).replace(/<\/?untrusted>/gi, "")}\n</untrusted>`;
+// The classifier run itself failed, which may or may not be the event's
+// fault: see main. detail is what it said.
+class ClassifierUnavailable extends Error {
+  constructor(cmd, detail) {
+    super(`'${cmd}' failed: ${detail}`);
+    this.detail = detail;
+  }
+}
+
+// Why the classifier's process failed: a spawn error or our timeout,
+// else the result in its JSON output (where claude reports errors such
+// as "Not logged in"), else the last line of its stderr, else how it
+// ended. Never e.message otherwise: it holds the command line, which
+// ends with the system prompt.
+function failure(e) {
+  if (typeof e.code === "string") return e.message; // e.g. "spawn claude ENOENT"
+  if (e.killed) return `timed out after ${CLASSIFY_TIMEOUT_MS / 1000}s`;
+  try {
+    const { result } = JSON.parse(e.stdout);
+    if (result) return String(result).slice(0, 200);
+  } catch { /* not JSON: look further */ }
+  const err = String(e.stderr || "").trim().split("\n").pop();
+  if (err) return err.slice(0, 200);
+  return e.signal ? `killed by ${e.signal}` : `exit status ${e.code}`;
+}
+
+// Runs the classifier on one event and its context, and returns its JSON
+// output ({result, total_cost_usd, ...}).
+async function runClassifier(event, ctxData) {
+  const input = `<untrusted>\n${JSON.stringify({ event, context: ctxData }, null, 1).replace(/<\/?untrusted>/gi, "")}\n</untrusted>`;
   const [cmd, ...args] = process.env[CLASSIFIER_ENV]
     ? [process.env[CLASSIFIER_ENV]]
     : ["claude", "-p", "--model", "haiku", "--tools", "", "--strict-mcp-config", "--setting-sources", "",
@@ -338,11 +372,39 @@ async function classify(ev, ctxData) {
   try {
     ({ stdout } = await child);
   } catch (e) {
-    throw new Error(`'${cmd}' failed: ${String(e.stderr || e.message).trim().split("\n").pop()}`);
+    throw new ClassifierUnavailable(cmd, failure(e));
   }
-  const out = JSON.parse(stdout);
-  if (out.is_error) throw new Error(`'${cmd}' failed: ${String(out.result).slice(0, 200)}`);
+  let out;
+  try {
+    out = JSON.parse(stdout);
+  } catch {
+    throw new ClassifierUnavailable(cmd, `no JSON output: ${excerpt(stdout).slice(0, 200)}`);
+  }
+  if (out.is_error) throw new ClassifierUnavailable(cmd, String(out.result).slice(0, 200));
+  return out;
+}
+
+async function classify(ev, ctxData) {
+  const out = await runClassifier({
+    type: ev.type, action: ev.action, repo: ev.repo, number: ev.number, url: ev.url, at: ev.time, by: OPERATOR, text: excerpt(ev.body),
+  }, ctxData);
   return { ...parseDecision(out.result), cost_usd: Number(out.total_cost_usd) || 0 };
+}
+
+// A canned, harmless event: when the classifier fails on a real one, it
+// tells whether the classifier works at all, independently of the events
+// queued and their threads.
+const PROBE_URL = `${GH}/example/probe/issues/1#issuecomment-1`;
+async function probeClassifier() {
+  try {
+    const out = await runClassifier({ type: "IssueCommentEvent", action: "created", repo: "example/probe", number: 1, url: PROBE_URL,
+      at: "2000-01-01T00:00:00Z", by: OPERATOR, text: "Thanks!" },
+    { issue: { title: "probe", author: BOT, pr: false }, board_item: null, last_comments: [], bot_last_comment: null });
+    return { works: true, cost_usd: Number(out.total_cost_usd) || 0 };
+  } catch (e) {
+    if (e instanceof ClassifierUnavailable) return { works: false, cost_usd: 0 };
+    throw e;
+  }
 }
 
 // --- Main ------------------------------------------------------------------
@@ -368,44 +430,80 @@ async function main() {
   const counts = { new: byId.size, ignored: 0, "bot-notify": 0, approval: 0, classified: 0, deferred: 0, failed: 0 };
   let cost = 0;
   let newest = cursor;
-  // The oldest event left for the next run: the cursor stays before it.
-  let held = null;
+  // The events left for the next run: the cursor stays before them.
+  const left = [];
+  const done = (ev) => {
+    state.seen[ev.id] = ev.time;
+    if (new Date(ev.time) > newest) newest = new Date(ev.time);
+  };
+  // A failure that is the event's: retried by the next runs, then listed
+  // for a human.
+  const charge = (ev, s, e) => {
+    const attempts = (state.attempts[ev.id] || 0) + 1;
+    if (attempts < MAX_CLASSIFY_ATTEMPTS) {
+      warn(`classifying ${ev.url} failed (attempt ${attempts} of ${MAX_CLASSIFY_ATTEMPTS}), the next run retries it: ${e.message}`);
+      state.attempts[ev.id] = attempts;
+      counts.failed++;
+      left.push(ev);
+      return;
+    }
+    warn(`classifying ${ev.url} failed ${attempts} times, listing it for a human: ${e.message}`);
+    decisions[ev.id] = { action: "ask", kind: "fyi", summary: "classifying this event failed; look at it yourself", confidence: 0,
+      cost_usd: 0, url: ev.url, at: ev.time, why: s.why, classified_at: now.toISOString() };
+    delete state.attempts[ev.id];
+    done(ev);
+  };
+  // A ClassifierUnavailable may be the event's fault (say, an API error on
+  // its text or thread) or not (no login, an outage). The canned probe,
+  // run at most once per run, tells: if the classifier works for it, the
+  // failure is charged to the event; if not, nothing is charged and
+  // nothing more is classified this run.
+  let probe = null;
+  let unavailable = null;
   for (const ev of [...byId.values()].sort((a, b) => a.time.localeCompare(b.time))) {
     if (ev.repo) (repos[ev.repo.toLowerCase()] ||= {})[ev.id] = ev.time;
     const s = await scope(ev, ctx);
     if (!s) {
       counts.ignored++;
-    } else if (s.handler !== "classifier") {
+      done(ev);
+      continue;
+    }
+    if (s.handler !== "classifier") {
       counts[s.handler]++;
       if (opts.verbose) process.stderr.write(`${PROG}: ${ev.url}: ${s.handler}'s (${s.why})\n`);
-    } else if (opts.dryRun || counts.classified >= MAX_CLASSIFY_PER_RUN) {
-      counts.deferred++;
-      held = held || ev.time;
+      done(ev);
       continue;
-    } else {
-      try {
-        const d = await classify(ev, await context(ev, s.item, ctx));
-        decisions[ev.id] = { ...d, url: ev.url, at: ev.time, why: s.why, classified_at: now.toISOString() };
-        counts.classified++;
-        cost += d.cost_usd;
-      } catch (e) {
-        const attempts = (state.attempts[ev.id] || 0) + 1;
-        if (attempts < MAX_CLASSIFY_ATTEMPTS) {
-          warn(`classifying ${ev.url} failed (attempt ${attempts} of ${MAX_CLASSIFY_ATTEMPTS}), the next run retries it: ${e.message}`);
-          state.attempts[ev.id] = attempts;
-          counts.failed++;
-          held = held || ev.time;
+    }
+    if (opts.dryRun || unavailable || counts.classified >= MAX_CLASSIFY_PER_RUN) {
+      counts.deferred++;
+      left.push(ev);
+      continue;
+    }
+    try {
+      const d = await classify(ev, await context(ev, s.item, ctx));
+      decisions[ev.id] = { ...d, url: ev.url, at: ev.time, why: s.why, classified_at: now.toISOString() };
+      counts.classified++;
+      cost += d.cost_usd;
+      delete state.attempts[ev.id];
+      done(ev);
+    } catch (e) {
+      if (e instanceof ClassifierUnavailable) {
+        if (!probe) {
+          probe = await probeClassifier();
+          cost += probe.cost_usd;
+          if (opts.verbose) process.stderr.write(`${PROG}: the classifier ${probe.works ? "works" : "fails too"} on a canned event\n`);
+        }
+        if (!probe.works) {
+          unavailable = e;
+          counts.deferred++;
+          left.push(ev);
           continue;
         }
-        warn(`classifying ${ev.url} failed ${attempts} times, listing it for a human: ${e.message}`);
-        decisions[ev.id] = { action: "ask", kind: "fyi", summary: "classifying this event failed; look at it yourself", confidence: 0,
-          cost_usd: 0, url: ev.url, at: ev.time, why: s.why, classified_at: now.toISOString() };
       }
-      delete state.attempts[ev.id];
+      charge(ev, s, e);
     }
-    state.seen[ev.id] = ev.time;
-    if (new Date(ev.time) > newest) newest = new Date(ev.time);
   }
+  const held = left.map((ev) => ev.time).sort()[0];
   if (held && new Date(held) <= newest) newest = new Date(new Date(held).getTime() - 1);
   if (opts.verbose) {
     process.stderr.write(`${PROG}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ")}; classifying cost $${cost.toFixed(4)}\n`);
@@ -431,7 +529,14 @@ async function main() {
     .map(([id, d]) => ({ line: `${d.kind} ${d.action} ${d.url}: ${d.summary}`, url: d.url, id, kind: d.kind, action: d.action,
       summary: d.summary, confidence: d.confidence, at: d.at }));
   process.stdout.write(opts.json ? `${JSON.stringify(rows)}\n` : rows.map((r) => `${r.line}\n`).join(""));
-  if (counts.failed) throw new Exit(EX_ERROR, `classifying ${counts.failed} event(s) failed`);
+  const errors = [];
+  if (counts.failed) errors.push(`classifying ${counts.failed} event(s) failed`);
+  if (unavailable) {
+    errors.push(`the classifier is unavailable (it fails on a canned event too), so this run classified nothing more `
+      + `(the next one retries): ${unavailable.message}`
+      + (LOGIN_RE.test(unavailable.detail) ? `\nhint: ${LOGIN_HINT}` : ""));
+  }
+  if (errors.length) throw new Exit(EX_ERROR, errors.join("; "));
 }
 
 main().catch((e) => {
