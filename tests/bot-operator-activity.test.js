@@ -23,7 +23,10 @@ test.after(() => fs.rmSync(WORK, { recursive: true, force: true }));
 
 // The stub classifier: logs each input (one JSON line) and answers by
 // the event's URL: act on reviews, ask on composefs-rs, act on private
-// repositories, none otherwise. Its input must fence the event.
+// repositories, none otherwise; with STUB_EXIT set, it prints STUB_STDOUT
+// and STUB_STDERR and exits with it (only for events whose text has
+// STUB_ONLY, if set). Its input must fence the event. The canned probe
+// event is on example/probe.
 fs.writeFileSync(STUB, `#!/usr/bin/env node
 const fs = require("node:fs");
 const input = fs.readFileSync(0, "utf8");
@@ -31,7 +34,12 @@ const m = /^<untrusted>\\n([\\s\\S]*)\\n<\\/untrusted>$/.exec(input);
 if (!m) { process.stderr.write("unfenced input"); process.exit(1); }
 const data = JSON.parse(m[1]);
 fs.appendFileSync(process.env.CLASSIFIER_LOG, JSON.stringify(data) + "\\n");
-if (data.event.text.includes("FAIL")) { process.stdout.write("not json"); process.exit(0); }
+if (process.env.STUB_EXIT && data.event.text.includes(process.env.STUB_ONLY || "")) {
+  process.stdout.write(process.env.STUB_STDOUT || "");
+  process.stderr.write(process.env.STUB_STDERR || "");
+  process.exit(Number(process.env.STUB_EXIT));
+}
+if (data.event.text.includes("FAIL")) { process.stdout.write(JSON.stringify({ result: "not json" })); process.exit(0); }
 const url = data.event.url;
 const d = url.includes("pullrequestreview-") ? { action: "act", kind: "review-feedback", summary: "address the requested changes" }
   : url.includes("composefs-rs") ? { action: "ask", kind: "answer", summary: "the operator answered the bot's question" }
@@ -102,7 +110,7 @@ fs.writeFileSync(BOARD, JSON.stringify([
     branch: `${GH}/cgwalters-forge/bootc/pull/12` },
 ]));
 
-function run(args = [], { state = "state", env = {}, status = 0 } = {}) {
+function run(args = [], { state = "state", env = {}, status = 0, raw = false } = {}) {
   const r = spawnSync(TOOL, ["--json", "--board-file", BOARD, "--now", NOW, ...args], {
     encoding: "utf8",
     env: { ...process.env, XDG_CACHE_HOME: path.join(WORK, "cache"), FAKE_GH_DIR: REST, BOT_PRIORITY_HEALTH_GH: FAKE_GH,
@@ -110,9 +118,12 @@ function run(args = [], { state = "state", env = {}, status = 0 } = {}) {
       BOT_OPERATOR_CONFIG: DEFAULT_CONFIG, ...env },
   });
   assert.equal(r.status, status, r.stderr);
-  return JSON.parse(r.stdout);
+  return raw ? r : JSON.parse(r.stdout);
 }
-const classified = () => (fs.existsSync(CLASSIFIER_LOG) ? fs.readFileSync(CLASSIFIER_LOG, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []);
+const PROBE = "example/probe";
+const logged = () => (fs.existsSync(CLASSIFIER_LOG) ? fs.readFileSync(CLASSIFIER_LOG, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []);
+const classified = () => logged().filter((d) => d.event.repo !== PROBE);
+const probes = () => logged().filter((d) => d.event.repo === PROBE).length;
 const resetLog = () => fs.rmSync(CLASSIFIER_LOG, { force: true });
 
 test("a dry run classifies nothing and saves no state", () => {
@@ -189,4 +200,80 @@ test("a failing classification holds the cursor, and is listed for a human after
   assert.equal(failed.line, `fyi ask ${failed.url}: classifying this event failed; look at it yourself`);
   assert.ok(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor >= before);
   assert.deepEqual(JSON.parse(fs.readFileSync(statePath, "utf8")).attempts, {});
+});
+
+// When the classifier fails (no login, missing, an API error), it is
+// tried once per run on a canned event: if that fails too, classifying
+// stops for the run and counts no attempt; if it works, the failing
+// events are charged an attempt. A reply that is not a decision always
+// counts toward the event's attempts.
+const NOT_LOGGED_IN = JSON.stringify({ type: "result", is_error: true, result: "Not logged in · Please run /login" });
+const API_400 = JSON.stringify({ is_error: true, result: "API Error: 400 invalid_request_error" });
+const failureAt = (i) => `2026-10-01T11:4${5 + i}:00Z`;
+// Puts the events with these texts (ids 901...) on the bot's PR, after the FEED's.
+const putFailureEvents = (texts) => put("users/cgwalters/events", [
+  ...texts.map((text, i) => commentEvent(901 + i, "cgwalters", "cgwalters-forge/bootc", 12, "cgwalters-bot", text, failureAt(i))), ...FEED]);
+const readState = (state, name = "state.json") => JSON.parse(fs.readFileSync(path.join(WORK, state, name), "utf8"));
+const FAILURE_CASES = [
+  ["a failing classifier reporting its result", { STUB_EXIT: "1", STUB_STDOUT: NOT_LOGGED_IN },
+    { message: /unavailable.*'\S+' failed: Not logged in · Please run \/login\nhint: no Claude login/ }],
+  ["an is_error result with exit status 0", { STUB_EXIT: "0", STUB_STDOUT: JSON.stringify({ is_error: true, result: "API Error: 529 overloaded" }) },
+    { message: /unavailable.*failed: API Error: 529 overloaded$/ }],
+  ["a failing classifier with only stderr", { STUB_EXIT: "3", STUB_STDERR: "first\nsegfault\n" }, { message: /unavailable.*failed: segfault$/ }],
+  ["a failing classifier saying nothing", { STUB_EXIT: "3" }, { message: /unavailable.*failed: exit status 3$/ }],
+  ["a missing classifier", { BOT_OPERATOR_ACTIVITY_CLASSIFIER: path.join(WORK, "missing") },
+    { message: /unavailable.*failed: spawn \S+missing ENOENT$/, calls: 0, probed: 0 }],
+  ["adjacent events failing, the next classified", { STUB_EXIT: "1", STUB_ONLY: "poison", STUB_STDOUT: API_400 },
+    { texts: ["poison 1", "poison 2", "healthy"], calls: 3, attempts: { "comment:901": 1, "comment:902": 1 }, decided: ["comment:903"],
+      message: /issuecomment-901 failed \(attempt 1 of 3\).*: API Error: 400 invalid_request_error\n.*issuecomment-902 failed.*\n.*error: classifying 2 event\(s\) failed$/ }],
+  ["a reply that is not a decision", { STUB_EXIT: "0", STUB_STDOUT: JSON.stringify({ result: "I would act on this." }) },
+    { message: /classifying 2 event\(s\) failed$/, calls: 2, probed: 0, attempts: { "comment:901": 1, "comment:902": 1 } }],
+];
+for (const [i, [name, env, { texts = ["first", "second"], message, calls = 1, probed = 1, attempts = {}, decided = [] }]] of FAILURE_CASES.entries()) {
+  test(`classifier failures: ${name}`, () => {
+    resetLog();
+    putFailureEvents(texts);
+    const state = `state-failure-${i}`;
+    fs.cpSync(path.join(WORK, "state"), path.join(WORK, state), { recursive: true });
+    const before = Object.keys(readState(state, "decisions.json"));
+    const r = run([], { state, env, status: 1, raw: true });
+    assert.match(r.stderr.trim(), message);
+    assert.doesNotMatch(r.stderr, /Reply with only/);
+    assert.equal(classified().length, calls);
+    assert.equal(probes(), probed);
+    const saved = readState(state);
+    assert.deepEqual(saved.attempts, attempts);
+    assert.ok(saved.cursor < failureAt(0));
+    assert.deepEqual(Object.keys(readState(state, "decisions.json")).filter((id) => !before.includes(id)), decided);
+  });
+}
+
+test("a later run with a working classifier classifies the held events", () => {
+  resetLog();
+  putFailureEvents(["first", "second"]);
+  run([], { state: "state-failure-0" });
+  assert.deepEqual(classified().map((d) => d.event.text), ["first", "second"]);
+  assert.equal(probes(), 0);
+  const saved = readState("state-failure-0");
+  assert.deepEqual(saved.attempts, {});
+  assert.equal(saved.cursor, new Date(failureAt(1)).toISOString());
+});
+
+test("an event the classifier always fails on is listed for a human after 3 runs", () => {
+  const state = "state-poison";
+  fs.cpSync(path.join(WORK, "state"), path.join(WORK, state), { recursive: true });
+  putFailureEvents(["poison alone"]);
+  const env = { STUB_EXIT: "1", STUB_ONLY: "poison", STUB_STDOUT: API_400 };
+  for (const attempt of [1, 2]) {
+    resetLog();
+    run([], { state, env, status: 1 });
+    assert.equal(probes(), 1);
+    assert.deepEqual(readState(state).attempts, { "comment:901": attempt });
+    assert.ok(readState(state).cursor < failureAt(0));
+  }
+  const rows = run([], { state, env });
+  const failed = rows.find((r) => r.url.endsWith("#issuecomment-901"));
+  assert.equal(failed.line, `fyi ask ${failed.url}: classifying this event failed; look at it yourself`);
+  assert.deepEqual(readState(state).attempts, {});
+  assert.equal(readState(state).cursor, new Date(failureAt(0)).toISOString());
 });
