@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI); nothing written, and no AI trailers in the last 100 commits on main
 dco: no (no branch rules on main, and no DCO check on any of the 8 recent PR heads sampled)
 sources:
@@ -69,3 +69,12 @@ Rebase the bot's PRs here only to resolve conflicts: the repository has a
 merge queue (workflows run on merge_group), and every push from an
 outside contributor needs its CI approved again. A maintainer asked for
 this in https://github.com/osbuild/image-builder/pull/2719#issuecomment-5844231608.
+
+## Operator default for silent repositories (2026-10-15)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. jmarrero adopted
+cgwalters' standing default for these repositories (jmarrero-forge/tracker#23):
+when he accepts a forge PR, it is posted upstream under the bot identity, and
+upstream rules on LLMs are an advisory warning unless they clearly disallow
+bot accounts.
