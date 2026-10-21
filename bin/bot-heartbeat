@@ -10,6 +10,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const backends = require(path.join(__dirname, "..", "lib", "backends.js"));
+const opencode = require(path.join(__dirname, "..", "lib", "opencode.js"));
+
 const PROG = path.basename(process.argv[1] || "bot-heartbeat");
 const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
 // The pinned, locked "Bot heartbeat" issue, whose one comment by the bot
@@ -77,9 +80,14 @@ const BUCKET_MS = 5 * 60 * 1000;
 const PROJECTS_ROOT = process.env.BOT_HEARTBEAT_PROJECTS || path.join(os.homedir(), ".claude", "projects");
 // The status line's JSON; it carries the conversation's metadata, not its text.
 const MAX_STATUSLINE_BYTES = 1024 * 1024;
-// A worker's subagents (itself, its reviewer), by the agentId the Agent tool returned.
+// A worker's subagents (itself, its reviewer), by the agentId the Agent
+// tool returned, or under opencode the task_id (its session's id) the task
+// tool did.
 const MAX_AGENT_IDS = 8;
-const AGENT_ID_RE = /^[A-Za-z0-9]{1,64}$/;
+const AGENT_ID_RE = /^(?:ses_)?[A-Za-z0-9]{1,64}$/;
+const isOpencodeId = (id) => typeof id === "string" && id.startsWith("ses_");
+// A usage window's kind, for a backend's name.
+const windowKind = (name) => name.toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/^[^a-z]+/, "").slice(0, 24) || "backend";
 const TOKEN_KEYS = ["input", "output", "cache_read", "cache_write"];
 
 const EX_ERROR = 1;
@@ -129,8 +137,8 @@ comment is public, so it carries names and links only. At most
 ${MAX_WORKERS} workers, with distinct names. A worker whose item is in a
 private (or unreadable) repository is dropped, and said so on stderr.
 agent_ids (optional, at most ${MAX_AGENT_IDS}) are the agentIds the Agent tool
-returned for the worker and its reviewer; they are only read here, to
-find their transcripts, and never published.
+returned for the worker and its reviewer (or opencode's task_ids); they
+are only read here, to find their transcripts, and never published.
 
 Unless --no-usage, publish also writes a usage snapshot, never to the
 public heartbeat: to the one comment the bot keeps on
@@ -146,6 +154,17 @@ of them), and of the coordinator's session in the 5-hour window. A
 failure to collect it is logged, and the heartbeat is published anyway.
 Without a status line reading from the last hour, a window is the last
 5 hours or 7 days. Sums are kept per ${BUCKET_MS / 60000} minutes in ${TRANSCRIPT_CACHE_FILE}.
+
+Where the coordinator runs on several backends (bot-coordinator-loop's
+${backends.STATE_FILE.replace(os.homedir(), "~")}), the snapshot also lists each one
+(active, available, its reading's percent and probe error), and has a
+window for opencode's: the month of GitHub Copilot premium requests,
+with the percent its probe last read (if under an hour old), and the
+requests (model calls, not Copilot's premium requests, which no session
+records) and tokens of opencode's sessions in ${opencode.DATA_DIR.replace(os.homedir(), "~")}
+and its archived copies. A worker's agent_ids may be opencode task_ids
+(ses_...), whose sessions and their subagents' are summed; a coordinator
+session that is an opencode session id gets its 5-hour tokens too.
 
 The heartbeat comment names items only inside code, so that editing it never
 adds a "mentioned this" event to them.
@@ -275,7 +294,7 @@ function validate(input, nowMs) {
     names.add(worker.name);
     if (w.agent_ids !== undefined && w.agent_ids !== null) {
       if (!Array.isArray(w.agent_ids) || w.agent_ids.length > MAX_AGENT_IDS) throw invalid(`${where}.agent_ids`, `must be an array of at most ${MAX_AGENT_IDS} agent ids`);
-      agentIds.set(worker.name, w.agent_ids.map((id, j) => checkString(id, `${where}.agent_ids[${j}]`, AGENT_ID_RE, "an agentId, 1-64 of [A-Za-z0-9]")));
+      agentIds.set(worker.name, w.agent_ids.map((id, j) => checkString(id, `${where}.agent_ids[${j}]`, AGENT_ID_RE, "an agentId (1-64 of [A-Za-z0-9]) or an opencode task_id (ses_ and 1-64 of them)")));
     }
     return worker;
   });
@@ -467,9 +486,70 @@ function windowSums(summaries, sinceMs) {
   return sum;
 }
 
+// opencodeSummaries(sinceMs, nowMs): the summary of each opencode
+// session updated since SINCEMS, as [{id, session (its root), kind},
+// summary], its buckets from SINCEMS on and its total over all of it.
+// A session in several databases (a copy of the live one in the archive)
+// is one summary, of its messages in any of them, each counted once.
+function opencodeSummaries(sinceMs, nowMs) {
+  const byId = new Map();
+  const seen = new Set();
+  for (const file of opencode.defaultDatabases()) {
+    let sessions;
+    try {
+      sessions = opencode.readSessions(file, { since: sinceMs, from: 0, until: nowMs });
+    } catch (e) {
+      log(`skipping ${file}: ${e.message}`);
+      continue;
+    }
+    for (const s of sessions) {
+      if (!byId.has(s.id)) {
+        byId.set(s.id, [{ id: s.id, parent_id: s.parent_id, session: s.root, kind: s.parent_id ? "subagent" : "session" }, { total: zeroTokens(), buckets: {} }]);
+      }
+      const { total, buckets } = byId.get(s.id)[1];
+      for (const u of s.usage) {
+        if (seen.has(u.id)) continue;
+        seen.add(u.id);
+        const tokens = { input: u.input, output: u.output + u.reasoning, cache_read: u.cache_read, cache_write: u.cache_write };
+        addTokens(total, tokens);
+        if (u.ts < sinceMs) continue;
+        const b = (buckets[Math.floor(u.ts / BUCKET_MS) * BUCKET_MS] ||= { requests: 0, ...zeroTokens() });
+        b.requests++;
+        addTokens(b, tokens);
+      }
+    }
+  }
+  return [...byId.values()];
+}
+
+// backendWindows(view, nowMs): a usage window for each backend whose
+// tokens are opencode's (Claude's are the status line's windows): its
+// reading's window, else the last 7 days, with the reading's percent
+// when there is one.
+function backendWindows(view, nowMs) {
+  return view.backends.filter((b) => b.source === "opencode").map((b) => {
+    const w = { kind: windowKind(b.name), since: iso(b.window ? Math.min(nowMs, b.window.start) : nowMs - LONGEST_WINDOW_MS) };
+    const resets = b.window ? b.window.end : b.reading && b.reading.resets_at;
+    if (b.reading && resets) Object.assign(w, { used_percent: Math.round(b.reading.used_percent * 10) / 10, resets_at: iso(resets) });
+    return w;
+  });
+}
+
+// readBackends(nowMs): the coordinator's backends (lib/backends.js), or
+// null without a harness that runs several, or when they can't be read.
+function readBackends(nowMs) {
+  try {
+    return backends.backendView(nowMs);
+  } catch (e) {
+    log(`no backends: ${e.message}`);
+    return null;
+  }
+}
+
 // collectUsage(nowMs, session, agentIds): {usage, workerTokens}: the
 // snapshot publish adds (aggregates only), and the tokens of each
 // worker's subagents in coordinator session SESSION, by worker name.
+// opencode task_ids are found in any session.
 function collectUsage(nowMs, session = null, agentIds = new Map()) {
   const plan = readRateLimits(nowMs);
   const windows = WINDOWS.map(({ kind, ms }) => {
@@ -481,18 +561,49 @@ function collectUsage(nowMs, session = null, agentIds = new Map()) {
   });
   const summaries = transcriptSummaries(Math.min(...windows.map((w) => Date.parse(w.since))), nowMs);
   for (const w of windows) Object.assign(w, windowSums(summaries, Date.parse(w.since)));
+  const view = readBackends(nowMs);
+  const extra = view ? backendWindows(view, nowMs) : [];
+  const ids = [...agentIds.values()].flat();
+  let oc = [];
+  if (extra.length || isOpencodeId(session) || ids.some(isOpencodeId)) {
+    oc = opencodeSummaries(Math.min(Date.parse(windows[0].since), ...extra.map((w) => Date.parse(w.since))), nowMs);
+  }
+  for (const w of extra) Object.assign(w, windowSums(oc, Date.parse(w.since)));
   const usage = {};
   if (plan) usage.observed_at = plan.observed_at;
-  usage.windows = windows;
+  usage.windows = [...windows, ...extra];
+  if (view) {
+    usage.backends = view.backends.map((b) => ({
+      name: b.name, active: b.active, available: b.available,
+      used_percent: b.reading ? b.reading.used_percent : null, ...(b.probe_error ? { probe_error: b.probe_error } : {}),
+    }));
+  }
   const workerTokens = new Map();
   if (session) {
     const mine = summaries.filter(([t]) => t.session === session);
-    const coordinator = mine.filter(([t]) => t.kind === "session");
+    const coordinator = [...mine.filter(([t]) => t.kind === "session"), ...oc.filter(([t]) => t.id === session)];
     if (coordinator.length) usage.coordinator_tokens = windowSums(coordinator, Date.parse(windows[0].since)).tokens;
     const byAgent = new Map(mine.filter(([t]) => t.kind === "subagent").map(([t, s]) => [path.basename(t.file, ".jsonl").replace(/^agent-/, ""), s]));
-    for (const [name, ids] of agentIds) {
-      const found = ids.filter((id) => byAgent.has(id));
-      if (found.length) workerTokens.set(name, found.reduce((acc, id) => addTokens(acc, byAgent.get(id).total), zeroTokens()));
+    // An opencode task's session, with its own subagents' (all of them).
+    const children = new Map();
+    for (const [t] of oc) if (t.parent_id) (children.get(t.parent_id) || children.set(t.parent_id, []).get(t.parent_id)).push(t.id);
+    const ocById = new Map(oc.map(([t, s]) => [t.id, s]));
+    const ocTotal = (id, seen = new Set()) => {
+      if (seen.has(id) || !ocById.has(id)) return null;
+      seen.add(id);
+      const sum = addTokens(zeroTokens(), ocById.get(id).total);
+      for (const c of children.get(id) || []) {
+        const t = ocTotal(c, seen);
+        if (t) addTokens(sum, t);
+      }
+      return sum;
+    };
+    for (const [name, list] of agentIds) {
+      // One seen set per worker: a reviewer listed next to the task it
+      // reviews, as its subagent, counts once.
+      const seen = new Set();
+      const found = list.map((id) => (isOpencodeId(id) ? ocTotal(id, seen) : byAgent.get(id)?.total ?? null)).filter(Boolean);
+      if (found.length) workerTokens.set(name, found.reduce((acc, t) => addTokens(acc, t), zeroTokens()));
     }
   }
   return { usage, workerTokens };
@@ -529,7 +640,7 @@ function usageLine(usage) {
   const { fmtTokens } = costLib();
   const parts = usage.windows.map((w) => {
     const pct = w.used_percent === undefined ? "" : `${w.used_percent}% used, resets ${w.resets_at}, `;
-    return `${WINDOW_LABEL[w.kind] ?? w.kind} window: ${pct}${fmtTokens(totalTokens(w.tokens))} tokens (${fmtTokens(w.tokens.output)} output) in ${w.requests} requests since ${w.since}`;
+    return `${WINDOW_LABEL[w.kind] ?? w.kind.replace(/_/g, " ")} window: ${pct}${fmtTokens(totalTokens(w.tokens))} tokens (${fmtTokens(w.tokens.output)} output) in ${w.requests} requests since ${w.since}`;
   });
   return `Usage, ${parts.join("; ")}.`;
 }
