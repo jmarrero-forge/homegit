@@ -85,6 +85,20 @@ test("projection: burn rate and percent at reset", () => {
   assert.ok(Math.abs(p.projected - 100 * 7 / 6) < 1e-9);
 });
 
+test("projection over a window of any length: Copilot's month, a 5-hour window", () => {
+  // 20% by day 10 of a 30-day month: 2 per day, 60% at the reset.
+  const p = cap.windowProjection({ usedPercent: 20, start: NOW - 10 * DAY, end: NOW + 20 * DAY, now: NOW });
+  assert.ok(Math.abs(p.burn_per_day - 2) < 1e-9);
+  assert.ok(Math.abs(p.projected - 60) < 1e-9);
+  // A month still waits 12 hours; 5 hours wait a 14th of theirs.
+  const HOUR = 3600e3;
+  const cases = [[DAY * 30, 11.9 * HOUR, false], [DAY * 30, 12 * HOUR, true], [5 * HOUR, 20 * 60e3, false], [5 * HOUR, 22 * 60e3, true]];
+  for (const [length, elapsed, want] of cases) {
+    const q = cap.windowProjection({ usedPercent: 10, start: NOW - elapsed, end: NOW - elapsed + length, now: NOW });
+    assert.equal(q.projected !== null, want, `${elapsed / HOUR}h of ${length / HOUR}h`);
+  }
+});
+
 test("calibration needs enough tokens", () => {
   assert.equal(cap.percentPerToken({ usedPercent: 10, tokens: 1e5 }), null);
   assert.equal(cap.percentPerToken({ usedPercent: 0, tokens: 1e7 }), null);
@@ -97,6 +111,49 @@ test("dispatch advice: all below 80%, P0 only from 80%, none at 100%", () => {
   const a = cap.dispatchAdvice(70);
   assert.equal(a.headroom, 30);
   assert.ok(a.fits(30) && !a.fits(30.1));
+  // Used up at a backend's threshold instead, with "P0 only" no later.
+  const limited = [[79.9, 95, "all"], [80, 95, "p0"], [95, 95, "none"], [69.9, 70, "all"], [70, 70, "none"]];
+  for (const [proj, limit, want] of limited) assert.equal(cap.dispatchAdvice(proj, limit).scope, want, `${proj} of ${limit}`);
+  assert.equal(cap.dispatchAdvice(80, 95).headroom, 15);
+});
+
+test("report on a backend: handoff headroom while a next one is up, the threshold on the last", () => {
+  const items = [{ id: "x", status: "Todo", priority: "P0", "est. cost": "M (<5M tok)" }];
+  const claude = { name: "claude", leave_at: 95, available: true, why: null };
+  // 40% by day 3.5 of the week on 40M tokens: 80% projected, 2.5% for an M.
+  const rate = { usedPercent: 40, resetsAt: NOW + 3.5 * DAY };
+  const cases = [
+    ["next up: no P0-only step, room before the handoff", { ...claude, next: "opencode" }, rate, "all", 55, /until the handoff to opencode at 95%/],
+    ["next up, past the threshold", { ...claude, next: "opencode" }, { ...rate, usedPercent: 96 }, "none", -1, /handoff/],
+    ["next up, no reading", { ...claude, next: "opencode" }, null, "unknown", null, /opencode takes over at claude's 95%/],
+    ["the last one: P0 only from 80%", { ...claude, next: null }, rate, "p0", 15, /claude is the last available backend, used up at 95%/],
+    ["the last one: nothing at its threshold", { ...claude, next: null }, { ...rate, usedPercent: 48 }, "none", 95 - 96, /last available/],
+    ["at its threshold, handing off", { ...claude, available: false, why: "at its threshold", next: "opencode" }, rate, "none", null,
+      /claude is at its threshold; the session hands off to opencode/],
+    ["at its threshold, the last", { ...claude, available: false, why: "at its threshold", next: null }, rate, "none", null,
+      /no other backend is available/],
+  ];
+  for (const [what, backend, r, scope, headroom, reason] of cases) {
+    const rep = cap.capacityReport({ rate: r, weekTokens: 40e6, budget: null, items, now: NOW, backend });
+    assert.equal(rep.dispatch.scope, scope, what);
+    if (headroom === null) assert.equal(rep.dispatch.headroom, null, what);
+    else assert.ok(Math.abs(rep.dispatch.headroom - headroom) < 1e-9, `${what}: headroom ${rep.dispatch.headroom}`);
+    assert.match(rep.dispatch.reason, reason, what);
+    assert.equal(rep.backend.name, "claude", what);
+  }
+  // A month's window: 20% by day 10 of 30, 60% projected.
+  const month = cap.capacityReport({ rate: { usedPercent: 20, startsAt: NOW - 10 * DAY, resetsAt: NOW + 20 * DAY }, weekTokens: 1e7,
+    budget: null, items, now: NOW, backend: { name: "opencode", leave_at: 95, available: true, next: null } });
+  assert.equal(month.source, "backend");
+  assert.ok(Math.abs(month.projected - 60) < 1e-9);
+  assert.equal(month.dispatch.scope, "all");
+  // A 5-hour window, the last backend: 80% after 4 hours projects to 100%,
+  // past its 95%.
+  const HOUR = 3600e3;
+  const short = cap.capacityReport({ rate: { usedPercent: 80, startsAt: NOW - 4 * HOUR, resetsAt: NOW + HOUR }, weekTokens: 1e7,
+    budget: null, items, now: NOW, backend: { name: "claude", leave_at: 95, available: true, next: null } });
+  assert.ok(Math.abs(short.projected - 100) < 1e-9);
+  assert.equal(short.dispatch.scope, "none");
 });
 
 test("report: statusline reading, estimates summed by bucket", () => {
