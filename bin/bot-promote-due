@@ -64,7 +64,8 @@ const ADVISORY_RE = /<!-- bot-promote-due advisory=([0-9a-f]{16}) -->/;
 // What check(), policy() and the attempts file add to a result that
 // --json leaves out.
 const INTERNAL = ["at", "human_text", "approval", "approved_head", "stale", "item", "notices", "advisories", "next", "view", "status"];
-const LLMS_TRAILER = "Generated-by: https://github.com/cgwalters/#llms";
+// The operator's Generated-by line (generated_by_url in their config).
+const LLMS_TRAILER = `Generated-by: ${CONFIG.generated_by_url}`;
 // bot-board's limit on a News line, less its date prefix.
 const NEWS_MAX = 185;
 // The bot's open PRs in the forge and in its own forks (the qualifiers

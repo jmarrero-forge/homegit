@@ -469,8 +469,9 @@ async function dispatchOne(a, opts, config) {
   }
 }
 
-// What a PR converted back to a draft is told.
-const MIDSTREAM_DRAFT_COMMENT = `Converted back to a draft: this repository is a midstream (topic ${ms.MIDSTREAM_TOPIC}), whose main mirrors upstream and only moves by fast-forward sync, so its PRs are review vehicles and are never merged.\n\nGenerated-by: https://github.com/cgwalters/#llms`;
+// What a PR converted back to a draft is told, ending with the operator's
+// Generated-by line.
+const midstreamDraftComment = (config) => `Converted back to a draft: this repository is a midstream (topic ${ms.MIDSTREAM_TOPIC}), whose main mirrors upstream and only moves by fast-forward sync, so its PRs are review vehicles and are never merged.\n\nGenerated-by: ${config.generated_by_url}`;
 
 // apply(actions, errors, opts, config): carries out the actions that have an
 // `apply` (a board change), a `draft` (a PR to convert) or a `dispatch`, recording the result in each. A
@@ -496,7 +497,7 @@ async function apply(actions, errors, opts, config) {
       continue;
     }
     try {
-      await execFileP(GH, ["pr", "comment", String(a.draft.number), "--repo", a.draft.repo, "--body", MIDSTREAM_DRAFT_COMMENT], { maxBuffer: MAX_BUFFER });
+      await execFileP(GH, ["pr", "comment", String(a.draft.number), "--repo", a.draft.repo, "--body", midstreamDraftComment(config)], { maxBuffer: MAX_BUFFER });
     } catch (e) {
       errors.push(`commenting on ${a.url}: ${firstLine(e)}`);
     }
