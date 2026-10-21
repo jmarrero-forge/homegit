@@ -8,5 +8,9 @@
   }},
   "elsewhere": {"id": "elsewhere", "models": {
     "gizmo-1": {"id": "gizmo-1", "cost": {"input": 1, "output": 2}}
+  }},
+  "github-copilot": {"id": "github-copilot", "models": {
+    "claude-sonnet-4-5": {"id": "claude-sonnet-4-5", "cost": {"input": 1, "output": 10, "cache_read": 0.1, "cache_write": 1}},
+    "gpt-9": {"id": "gpt-9", "cost": {"input": 2, "output": 10, "cache_read": 0.5, "cache_write": 2}}
   }}
 }

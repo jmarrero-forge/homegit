@@ -1,7 +1,8 @@
 // Offline tests of bin/bot-cost against the synthetic transcripts, runs and
 // prices in tests/fixtures/bot-cost (a fake gh serves the Actions runs and
-// jobs, a fake bot-runs the agent runs). Run with tests/bot-cost.sh, or
-// node --test tests/bot-cost.test.js.
+// jobs, a fake bot-runs the agent runs), and an opencode database built by
+// tests/opencode-db.js. Run with tests/bot-cost.sh, or node --test
+// tests/bot-cost.test.js.
 "use strict";
 
 const assert = require("node:assert/strict");
@@ -15,8 +16,10 @@ const FIXTURES = path.join(__dirname, "fixtures", "bot-cost");
 const TOOL = path.join(__dirname, "..", "bin", "bot-cost");
 const CACHE = fs.mkdtempSync(path.join(os.tmpdir(), "bot-cost-test-"));
 const GH_LOG = path.join(CACHE, "gh.log");
+// No opencode database but the tests' own.
 const ENV = {
-  ...process.env, XDG_CACHE_HOME: CACHE, FAKE_GH_LOG: GH_LOG, BOT_COST_NOW: "2026-09-22T00:00:00Z",
+  ...process.env, XDG_CACHE_HOME: CACHE, XDG_DATA_HOME: path.join(CACHE, "data"), XDG_STATE_HOME: path.join(CACHE, "state"),
+  FAKE_GH_LOG: GH_LOG, BOT_COST_NOW: "2026-09-22T00:00:00Z",
   BOT_COST_GH: path.join(FIXTURES, "fake-gh"), BOT_COST_BOT_RUNS: path.join(FIXTURES, "fake-bot-runs"),
   BOT_COST_MODELS_JSON: path.join(FIXTURES, "models.json"),
 };
@@ -25,6 +28,7 @@ const ARGS = ["--since", "2026-09-20", "--until", "2026-09-23", "--projects", pa
 // The module reads its environment once, at load.
 Object.assign(process.env, ENV);
 const cost = require(TOOL);
+const { makeOpencodeDb, tokens } = require(path.join(__dirname, "opencode-db.js"));
 test.after(() => fs.rmSync(CACHE, { recursive: true, force: true }));
 
 const run = (args) => execFileSync(TOOL, args, { env: ENV, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -73,6 +77,10 @@ test("model ids resolve to models.dev entries", () => {
     ["claude-sonnet-4-5-20250929", "anthropic/claude-sonnet-4-5"],
     ["anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"],
     ["gizmo-1", "elsewhere/gizmo-1"],
+    // opencode's: the provider it names first, whatever Anthropic has.
+    ["github-copilot/claude-sonnet-4-5", "github-copilot/claude-sonnet-4-5"],
+    ["github-copilot/gpt-9", "github-copilot/gpt-9"],
+    ["github-copilot/gizmo-1", "elsewhere/gizmo-1"],
     ["mystery-9", null],
   ];
   for (const [id, want] of cases) assert.equal((cost.modelPrice(models, id) || { id: null }).id, want, id);
@@ -227,6 +235,76 @@ test("finished runs' jobs are cached, running ones refetched", () => {
   run([...ARGS, "--no-inference", "--json"]);
   const jobCalls = fs.readFileSync(GH_LOG, "utf8").split("\n").filter((l) => l.includes("/jobs"));
   assert.deepEqual(jobCalls.map((l) => /runs\/(\d+)\/jobs/.exec(l)[1]), ["102"]);
+});
+
+// An opencode database: a task with an Item line, its reviewer (a task
+// subagent with no marker of its own), and a session in a scratch dir.
+const OPENCODE_DB = path.join(CACHE, "oc", "opencode.db");
+const ITEM7 = "https://github.com/o/r/issues/7";
+makeOpencodeDb(OPENCODE_DB, [
+  { id: "ses_root1", title: "Fix seven", prompt: `Read the preamble.\nItem: ${ITEM7}\n`, commands: ["bot-devspace start --cores 4 oc-seven"],
+    messages: [
+      { id: "msg_a1", ts: "2026-09-20T10:00:00Z", model: "github-copilot/gpt-9", tokens: tokens(100, 50, 10, 1000, 0) },
+      // Before the window.
+      { id: "msg_a0", ts: "2026-09-19T10:00:00Z", model: "github-copilot/gpt-9", tokens: tokens(9e6, 0, 0, 0, 0) },
+    ] },
+  { id: "ses_sub1", parent_id: "ses_root1", title: "Review seven", prompt: "Review the change.",
+    messages: [{ id: "msg_b1", ts: "2026-09-20T11:00:00Z", model: "github-copilot/claude-sonnet-4-5", tokens: tokens(10, 20, 0, 500, 200) }] },
+  { id: "ses_root2", directory: "/tmp/c/scratchpad/oc-task/repo", prompt: "Do something.",
+    messages: [{ id: "msg_c1", ts: "2026-09-21T09:00:00Z", model: "github-copilot/unknown-1", tokens: tokens(5, 5, 0, 0, 0) }] },
+]);
+const OC_ARGS = ["--since", "2026-09-20", "--until", "2026-09-23", "--no-compute", "--opencode-db", OPENCODE_DB];
+
+test("opencode sessions: tokens per model, and their tasks", () => {
+  // The same database twice (an archived copy, say) counts once.
+  const s = JSON.parse(run([...OC_ARGS, "--opencode-db", OPENCODE_DB, "--source", "opencode", "--json"]));
+  const tasks = Object.fromEntries(s.tasks.map((t) => [t.key, t]));
+  assert.deepEqual(Object.keys(tasks).sort(), [ITEM7, "scratch:oc-task"]);
+  const t = tasks[ITEM7];
+  // Reasoning is output; the reviewer's tokens are its parent's task's.
+  assert.equal(t.tokens, 100 + 60 + 1000 + 10 + 20 + 500 + 200);
+  assert.equal(t.fresh_tokens, 160 + 230);
+  assert.deepEqual([t.sessions, t.subagents, t.devspaces, t.agents], [["ses_root1"], ["ses_sub1"], ["oc-seven"], 2]);
+  const gpt = (100 * 2 + 60 * 10 + 1000 * 0.5) / 1e6;
+  const sonnet = (10 * 1 + 20 * 10 + 500 * 0.1 + 200 * 1) / 1e6;
+  close(t.models["github-copilot/gpt-9"].usd, gpt, "gpt-9");
+  close(t.models["github-copilot/claude-sonnet-4-5"].usd, sonnet, "sonnet via Copilot");
+  assert.deepEqual(t.models["github-copilot/gpt-9"].tokens, { input: 100, output: 60, cache_read: 1000, cache_write_5m: 0, cache_write_1h: 0 });
+  assert.equal(tasks["scratch:oc-task"].fresh_tokens, 10);
+  assert.equal(s.totals.fresh_tokens, 400);
+  const notes = s.notes.join("\n");
+  assert.match(notes, /GitHub Copilot bills premium requests/);
+  assert.match(notes, /No price on models.dev for model\(s\) github-copilot\/unknown-1/);
+});
+
+test("--source picks the local sessions; a database that can't be read is a note", () => {
+  const claudeOnly = JSON.parse(run([...OC_ARGS, ...ARGS.slice(-2), "--source", "claude", "--json"]));
+  assert.ok(claudeOnly.tasks.length > 0);
+  assert.ok(!claudeOnly.tasks.some((t) => t.key === ITEM7 || t.key === "scratch:oc-task"));
+  const both = JSON.parse(run([...OC_ARGS, ...ARGS.slice(-2), "--json"]));
+  assert.equal(both.totals.fresh_tokens, claudeOnly.totals.fresh_tokens + 400);
+  const broken = path.join(CACHE, "broken.db");
+  fs.writeFileSync(broken, "not a database");
+  const s = JSON.parse(run(["--since", "2026-09-20", "--no-compute", "--opencode-db", broken, "--source", "opencode", "--json"]));
+  assert.equal(s.tasks.length, 0);
+  assert.match(s.notes.join("\n"), /opencode sessions in .*broken\.db are not counted/);
+  assert.throws(() => run(["--source", "codex"]), (e) => e.status === 2 && /--source takes claude or opencode/.test(e.stderr));
+});
+
+test("opencode's default databases: the live one and bot-coordinator-loop's archived copies", () => {
+  const data = path.join(ENV.XDG_DATA_HOME, "opencode", "opencode.db");
+  const archived = path.join(ENV.XDG_STATE_HOME, "bot-coordinator", "archive", "opencode", "20260920T000000Z-opencode", "opencode.db");
+  for (const f of [data, archived]) fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.copyFileSync(OPENCODE_DB, archived);
+  makeOpencodeDb(data, [{ id: "ses_live", prompt: "Item: PVTI_live",
+    messages: [{ id: "msg_l1", ts: "2026-09-21T12:00:00Z", model: "github-copilot/gpt-9", tokens: tokens(1, 1, 0, 0, 0) }] }]);
+  try {
+    const s = JSON.parse(run(["--since", "2026-09-20", "--no-compute", "--source", "opencode", "--json"]));
+    assert.deepEqual(s.tasks.map((t) => t.key).sort(), ["PVTI_live", ITEM7, "scratch:oc-task"]);
+  } finally {
+    fs.rmSync(ENV.XDG_DATA_HOME, { recursive: true, force: true });
+    fs.rmSync(ENV.XDG_STATE_HOME, { recursive: true, force: true });
+  }
 });
 
 test("usage errors", () => {

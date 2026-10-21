@@ -2,7 +2,8 @@
 // Approximate cost of the bot's work: runner time of the devspace and
 // agent workflows, and inference tokens from local transcripts and agent
 // runs, priced from published list prices. See --help.
-// Node's standard library only, plus gh and bot-runs.
+// Node's standard library only (node:sqlite for opencode's database), plus
+// gh and bot-runs.
 "use strict";
 
 const { execFile } = require("node:child_process");
@@ -12,6 +13,7 @@ const path = require("node:path");
 const { promisify } = require("node:util");
 
 const { itemMarker } = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const opencode = require(path.join(__dirname, "..", "lib", "opencode.js"));
 
 const execFileP = promisify(execFile);
 
@@ -63,12 +65,18 @@ const CACHE_1H_INPUT_MULT = 2;
 // Above this many prompt tokens, a model's context_over_200k prices apply.
 const LONG_CONTEXT_TOKENS = 200000;
 const SYNTHETIC_MODEL = "<synthetic>";
+// How opencode names the models it reaches through a GitHub Copilot login.
+const COPILOT_PREFIX = "github-copilot/";
 
 const TOP_TASKS = 15;
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 
 const TOKEN_KINDS = ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h"];
+// Where local inference is read from (--source): Claude Code's transcripts
+// and opencode's database. The coordinator's backends of the same names
+// spend them (see lib/backends.js).
+const SOURCES = ["claude", "opencode"];
 
 class Exit extends Error {
   constructor(status, message) {
@@ -78,9 +86,9 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} [--since AGE] [--until DATE] [--projects DIR]... [--repo OWNER/REPO]...
-                [--no-compute] [--no-inference] [--models-json FILE] [--refresh-prices]
-                [--tasks N] [--json]
+  return `Usage: ${PROG} [--since AGE] [--until DATE] [--projects DIR]... [--opencode-db FILE]...
+                [--source claude|opencode]... [--repo OWNER/REPO]... [--no-compute]
+                [--no-inference] [--models-json FILE] [--refresh-prices] [--tasks N] [--json]
 
 Estimates what the bot's work cost, per UTC day and per task, at
 published list prices. It is an estimate, not a bill.
@@ -97,13 +105,23 @@ published list prices. It is an estimate, not a bill.
   inference  token usage of every assistant message in the Claude Code
              transcripts under --projects (default: each directory in
              ${DEFAULT_PROJECTS_ROOT.replace(HOME, "~")}), and the token-usage.jsonl of ${AGENT_WORKFLOW} runs
-             (through bot-runs), priced from ${MODELS_URL},
+             (through bot-runs), and of every model call in opencode's
+             sessions in --opencode-db (default: ${opencode.DATA_DIR.replace(HOME, "~")}/${opencode.DB_NAME},
+             and the copies bot-coordinator-loop archived under
+             ${opencode.ARCHIVE_DIR.replace(HOME, "~")}/*/), priced from ${MODELS_URL},
              cached for a week in ${CACHE_DIR.replace(HOME, "~")} (--refresh-prices refetches;
              --models-json reads a saved copy). Runs of the mock inference
-             shim are counted apart and not priced.
+             shim are counted apart and not priced. opencode's GitHub
+             Copilot models get models.dev's github-copilot list prices;
+             Copilot bills premium requests, not tokens, so that $ is
+             notional, and Copilot's own count of premium requests isn't
+             in any session (bot-coordinator-loop status shows the
+             month's percent). --source claude or opencode (repeatable)
+             reads only those local sessions.
 
 Tasks are the board item (an "Item: URL-or-PVTI_ID" line, else a PVTI_
-id), scratch dir or devspace named in a subagent's prompt; a devspace run belongs to the agent that started it by name.
+id), scratch dir or devspace named in a subagent's prompt (an opencode
+subagent without one works on its parent session's task); a devspace run belongs to the agent that started it by name.
 Each task's fresh_tokens (input, output and cache writes, not cache
 reads) is what the board's Est. cost buckets and bot-actuals count. With
 --json, each task also lists its first and last message times, its
@@ -117,7 +135,7 @@ AGE is 12h, 7d, 2w, 'today' or 'yesterday' (midnight UTC), or a date
 
 function parseArgs(argv) {
   const opts = {
-    since: DEFAULT_SINCE, until: null, projects: [], repos: [], compute: true, inference: true,
+    since: DEFAULT_SINCE, until: null, projects: [], opencodeDbs: [], sources: [], repos: [], compute: true, inference: true,
     modelsJson: process.env.BOT_COST_MODELS_JSON || null, refreshPrices: false, tasks: TOP_TASKS, json: false,
   };
   const value = (i, name) => {
@@ -134,6 +152,13 @@ function parseArgs(argv) {
       case "--since": opts.since = value(i++, a); break;
       case "--until": opts.until = value(i++, a); break;
       case "--projects": opts.projects.push(value(i++, a)); break;
+      case "--opencode-db": opts.opencodeDbs.push(value(i++, a)); break;
+      case "--source": {
+        const src = value(i++, a);
+        if (!SOURCES.includes(src)) throw new Exit(EX_USAGE, `--source takes ${SOURCES.join(" or ")}, not '${src}'`);
+        opts.sources.push(src);
+        break;
+      }
       case "--repo": {
         const r = value(i++, a);
         if (!/^[\w.-]+\/[\w.-]+$/.test(r)) throw new Exit(EX_USAGE, `--repo takes OWNER/REPO, not '${r}'`);
@@ -153,6 +178,7 @@ function parseArgs(argv) {
         throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
     }
   }
+  if (!opts.sources.length) opts.sources = SOURCES;
   if (!opts.repos.length) opts.repos = (process.env.BOT_COST_REPOS || DEFAULT_REPOS.join(",")).split(",").filter(Boolean);
   return opts;
 }
@@ -415,11 +441,16 @@ async function loadModels(opts, notes) {
 
 // modelPrice(models, id): {id, cost} of the models.dev entry for a model
 // id as transcripts record it (claude-opus-5-5, claude-opus-5-5[1m],
-// anthropic/claude-sonnet-4-5-20250929), or null.
+// anthropic/claude-sonnet-4-5-20250929, or opencode's
+// github-copilot/claude-sonnet-5.5), or null. A provider the id names
+// is tried first, whichever it is (on purpose: its own price is the
+// better guess), then Anthropic, then any.
 function modelPrice(models, id) {
+  const named = (/^([\w.-]+)\//.exec(id) || [])[1];
   const base = id.replace(/\[[^\]]*\]$/, "").replace(/^[\w.-]+\//, "");
   const candidates = [base, base.replace(/-\d{8}$/, "")];
-  const providers = [models[MODELS_PROVIDER], ...Object.entries(models).filter(([k]) => k !== MODELS_PROVIDER).map(([, v]) => v)];
+  const first = [named, MODELS_PROVIDER].filter((k, i, a) => k && models[k] && a.indexOf(k) === i);
+  const providers = [...first.map((k) => models[k]), ...Object.entries(models).filter(([k]) => !first.includes(k)).map(([, v]) => v)];
   for (const c of candidates) {
     for (const p of providers) {
       const m = p && p.models && p.models[c];
@@ -570,6 +601,47 @@ function readTranscript(t, win) {
   return { agent, usage };
 }
 
+// opencodeAgents(file, win, seen): each opencode session of the database
+// FILE with model calls inside the window, as readTranscript's {agent,
+// usage}. A message id in SEEN (one counted from another copy of the
+// database) is skipped, and added otherwise.
+function opencodeAgents(file, win, seen) {
+  const sessions = opencode.readSessions(file, { since: win.since, until: win.until, details: true });
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const marks = new Map();
+  // A session's item and scratch dir: its prompt's, else its parent's
+  // (a subagent works on the task of the session that started it), else
+  // the scratch dir it runs in.
+  const markOf = (s, depth = 0) => {
+    if (marks.has(s.id)) return marks.get(s.id);
+    const prompt = s.prompt || "";
+    let m = { item: prompt ? itemMarker(prompt) : null, scratch: (SCRATCH_RE.exec(prompt) || [])[1] || null };
+    const parent = byId.get(s.parent_id);
+    if (!m.item && !m.scratch && parent && depth < byId.size) m = markOf(parent, depth + 1);
+    if (!m.item && !m.scratch) m = { item: null, scratch: (SCRATCH_RE.exec(`${s.directory || ""}/`) || [])[1] || null };
+    marks.set(s.id, m);
+    return m;
+  };
+  return sessions.map((s) => {
+    const kind = s.parent_id ? "subagent" : "session";
+    const { item, scratch } = markOf(s);
+    const devspaces = [];
+    const d = (DEVSPACE_PROMPT_RE.exec(s.prompt || "") || [])[1];
+    for (const n of [d, ...s.commands.flatMap(devspacesStarted)]) if (n && !devspaces.includes(n)) devspaces.push(n);
+    const usage = s.usage.filter((u) => !seen.has(u.id)).map((u) => {
+      seen.add(u.id);
+      // Reasoning tokens are billed as output; opencode counts them apart.
+      return { ts: u.ts, model: u.model, speed: null, input: u.input, output: u.output + u.reasoning,
+        cache_read: u.cache_read, cache_write_5m: u.cache_write, cache_write_1h: 0 };
+    });
+    const agent = {
+      key: s.id, kind, session: s.root, label: s.title || `opencode ${kind} ${s.id}`, item, scratch, devspaces,
+      first_ts: usage.length ? Math.min(...usage.map((u) => u.ts)) : null,
+    };
+    return { agent, usage };
+  });
+}
+
 // agentRunUsage(repo, run, notes): the per-request usage of an agent.yml
 // run, from its token-usage.jsonl, else its summary's totals.
 async function agentRunUsage(repo, run) {
@@ -679,10 +751,29 @@ async function scan(opts) {
   };
   const addUnique = (list, v) => v && !list.includes(v) && list.push(v);
 
-  // Local transcripts first: they name the devspaces each agent started.
+  // Local sessions first: they name the devspaces each agent started.
   const devspaceOwners = new Map();
+  const addAgent = ({ agent, usage }) => {
+    for (const n of agent.devspaces) {
+      (devspaceOwners.get(n) || devspaceOwners.set(n, []).get(n)).push(agent);
+    }
+    if (!usage.length) return;
+    const key = agent.item || (agent.scratch && `scratch:${agent.scratch}`) || (agent.kind === "session" ? `session:${agent.key}` : `agent:${agent.key}`);
+    const tk = task(key, agent.label);
+    tk.item ||= agent.item;
+    tk.scratch ||= agent.scratch;
+    agent.devspaces.forEach((n) => addUnique(tk.devspaces, n));
+    addUnique(tk.sessions, agent.session);
+    if (agent.kind === "subagent") addUnique(tk.subagents, agent.key);
+    tk.agents++;
+    agent.task = key;
+    agents.push({ ...agent, messages: usage.length });
+    usage.forEach((u) => priceUsage(u, tk));
+  };
   if (opts.inference) {
     prices = await loadModels(opts, notes);
+  }
+  if (opts.inference && opts.sources.includes("claude")) {
     let dirs = opts.projects;
     if (!dirs.length) {
       try {
@@ -692,23 +783,19 @@ async function scan(opts) {
         notes.push(`No local transcripts: cannot read ${DEFAULT_PROJECTS_ROOT} (${e.code || e.message}).`);
       }
     }
-    for (const t of transcriptFiles(dirs, win.since)) {
-      const { agent, usage } = readTranscript(t, win);
-      for (const n of agent.devspaces) {
-        (devspaceOwners.get(n) || devspaceOwners.set(n, []).get(n)).push(agent);
+    for (const t of transcriptFiles(dirs, win.since)) addAgent(readTranscript(t, win));
+  }
+  if (opts.inference && opts.sources.includes("opencode")) {
+    const seen = new Set();
+    for (const file of opts.opencodeDbs.length ? opts.opencodeDbs : opencode.defaultDatabases()) {
+      let found;
+      try {
+        found = opencodeAgents(file, win, seen);
+      } catch (e) {
+        notes.push(`opencode sessions in ${file.replace(HOME, "~")} are not counted: ${e.message}`);
+        continue;
       }
-      if (!usage.length) continue;
-      const key = agent.item || (agent.scratch && `scratch:${agent.scratch}`) || (agent.kind === "session" ? `session:${agent.key}` : `agent:${agent.key}`);
-      const tk = task(key, agent.label);
-      tk.item ||= agent.item;
-      tk.scratch ||= agent.scratch;
-      agent.devspaces.forEach((n) => addUnique(tk.devspaces, n));
-      addUnique(tk.sessions, agent.session);
-      if (agent.kind === "subagent") addUnique(tk.subagents, agent.key);
-      tk.agents++;
-      agent.task = key;
-      agents.push({ ...agent, messages: usage.length });
-      usage.forEach((u) => priceUsage(u, tk));
+      found.forEach(addAgent);
     }
   }
 
@@ -758,6 +845,9 @@ async function scan(opts) {
     }
   }
   if (mockTokens) notes.push(`${fmtTokens(mockTokens)} tokens of ${AGENT_WORKFLOW} runs came from the mock inference shim and are not priced.`);
+  if (Object.keys(models).some((m) => m.startsWith(COPILOT_PREFIX))) {
+    notes.push("GitHub Copilot bills premium requests, not tokens: the $ of its models is notional, at models.dev's list prices.");
+  }
   const unknown = Object.values(models).filter((m) => !m.priced_as).map((m) => m.model);
   if (unknown.length) notes.push(`No price on models.dev for model(s) ${unknown.join(", ")}: their tokens are counted but not priced.`);
   if (opts.inference && Object.values(models).some((m) => m.tokens.cache_write_1h)) {
@@ -881,6 +971,6 @@ if (require.main === module) {
   module.exports = {
     parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspaceName, devspacesStarted, render, scan,
     // For bot-heartbeat's usage snapshot.
-    transcriptFiles, readTranscript, fmtTokens,
+    transcriptFiles, readTranscript, fmtTokens, opencodeAgents,
   };
 }
