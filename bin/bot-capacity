@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Planning by capacity: this week's usage and burn rate, the projection at
 // the reset, and the open P0/P1 estimates by bucket. See --help. Node's
-// standard library only, plus bot-cost and bot-board.
+// standard library only, plus bot-cost and bot-board (and python3, where
+// the coordinator runs on several backends; see lib/backends.js).
 "use strict";
 
 const { execFileSync } = require("node:child_process");
@@ -10,6 +11,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const backends = require(path.join(__dirname, "..", "lib", "backends.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-capacity");
 const COST = process.env.BOT_CAPACITY_COST || path.join(__dirname, "bot-cost");
@@ -36,9 +38,21 @@ The percent is the seven_day.used_percentage that \`bot-heartbeat
 statusline\` saves (${RATE_FILE.replace(os.homedir(), "~")}), if it is under an hour old and
 its window hasn't reset. Otherwise, with --budget (fresh tokens per week;
 or \$${BUDGET_ENV}), it is the trailing 7 days' fresh tokens (input, output
-and cache writes, from bot-cost) over the budget. With neither there are
+and cache writes) of Claude Code's sessions (bot-cost --source claude)
+over the budget. With neither there are
 only token totals. Estimates become percent at this week's percent per
 token; a bucket counts as ${cap.BUCKETS.map((b) => `${b.key} ${b.expected / 1e3}k`).join(", ")} tokens.
+
+Where the coordinator runs on several backends, handing off from one to
+the next at a usage threshold (bot-coordinator-loop's state in
+${backends.STATE_FILE.replace(os.homedir(), "~")}), it measures the active backend
+instead: its reading (Claude's 7-day window, Copilot's monthly premium
+requests) if under an hour old, over that reading's window, and the
+tokens of that backend's own sessions (bot-cost --source). While a next
+backend is available, all work may be dispatched that fits before the
+handoff at the active one's threshold (leave_at); on the last available
+one, P0 only from ${cap.P0_ONLY_PERCENT}% projected and nothing at its threshold. An active
+backend at its threshold gets nothing new.
 `;
 }
 
@@ -63,14 +77,43 @@ function readRate(now) {
 const pct = (n) => (n === null || n === undefined ? "?" : `${n.toFixed(1)}%`);
 const tok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
 
+// What the report's percent comes from.
+function sourceText(r) {
+  if (r.backend) {
+    if (r.source === "backend") return `${r.backend.name}'s usage reading`;
+    const why = `no reading for ${r.backend.name}: ${r.no_reading || "?"}`;
+    return r.source === "budget" ? `tokens over the budget; ${why}` : `tokens only; ${why}, and no budget`;
+  }
+  return { statusline: "plan usage (statusline)", budget: "tokens over the budget", tokens: "tokens only (no statusline reading, no budget)" }[r.source];
+}
+
+function dispatchText(r) {
+  const d = r.dispatch;
+  if (!r.backend) {
+    return { all: "P0 and P1", p0: `P0 only (projected at or above ${cap.P0_ONLY_PERCENT}%)`, none: "nothing (the week's capacity is used up)",
+      unknown: "unknown (no percent: pass --budget or run bot-heartbeat statusline)" }[d.scope];
+  }
+  const scope = { all: "P0 and P1", p0: `P0 only (projected at or above ${Math.min(cap.P0_ONLY_PERCENT, r.backend.leave_at)}%)`, none: "nothing new",
+    unknown: `unknown (no percent for ${r.backend.name}: pass --budget)` }[d.scope];
+  return `${scope}; ${d.reason}`;
+}
+
 function render(r) {
   const out = [];
-  const src = { statusline: "plan usage (statusline)", budget: "tokens over the budget", tokens: "tokens only (no statusline reading, no budget)" }[r.source];
-  out.push(`Week (${src}): ${tok(r.used_tokens)} fresh tokens${r.used_percent === null ? "" : `, ${pct(r.used_percent)} used`}`);
+  if (r.backends) {
+    const each = r.backends.map((b) => {
+      const reading = b.used_percent === null ? `no reading (${b.no_reading})` : `${pct(b.used_percent)} used`;
+      const tags = [b.active && "active", b.name === r.backend.next && "next", !b.available && `unavailable: ${b.why || "not probed yet"}`].filter(Boolean);
+      return `${b.name}${tags.length ? ` (${tags.join(", ")})` : ""} ${reading}, leaves at ${b.leave_at}%`;
+    });
+    out.push(`Backends: ${each.join("; ")}`);
+    if (r.config_error) out.push(`  (thresholds are bot-coordinator-loop's defaults: ${r.config_error})`);
+  }
+  out.push(`${r.backend ? "Window" : "Week"} (${sourceText(r)}): ${tok(r.used_tokens)} fresh tokens${r.used_percent === null ? "" : `, ${pct(r.used_percent)} used`}`);
   if (r.burn_per_day !== null) out.push(`Burn: ${pct(r.burn_per_day)}/day, ${tok(r.burn_tokens_per_day)} tokens/day`);
   else out.push(`Burn: ${tok(r.burn_tokens_per_day)} tokens/day (trailing 7 days)`);
   if (r.resets_at) {
-    out.push(`Resets ${r.resets_at}; projected at reset: ${r.projected === null ? "too early in the week to say" : pct(r.projected)}`);
+    out.push(`Resets ${r.resets_at}; projected at reset: ${r.projected === null ? `too early in the ${r.backend ? "window" : "week"} to say` : pct(r.projected)}`);
   } else if (r.projected !== null) out.push(`Projected (rolling week): ${pct(r.projected)}`);
   out.push("", "Open P0/P1 (Todo, In Progress) by Est. cost:");
   const rows = [["", ...cap.BUCKETS.map((b) => b.key), "none", "tokens", "percent", "fits"]];
@@ -81,9 +124,8 @@ function render(r) {
   }
   const w = rows[0].map((_, i) => Math.max(...rows.map((x) => String(x[i]).length)));
   for (const x of rows) out.push("  " + x.map((c, i) => (i ? String(c).padStart(w[i]) : String(c).padEnd(w[i]))).join("  "));
-  const scope = { all: "P0 and P1", p0: `P0 only (projected at or above ${cap.P0_ONLY_PERCENT}%)`, none: "nothing (the week's capacity is used up)",
-    unknown: "unknown (no percent: pass --budget or run bot-heartbeat statusline)" }[r.dispatch.scope];
-  out.push("", `Dispatch: ${scope}${r.dispatch.headroom === null ? "" : `; headroom after projection ${pct(r.dispatch.headroom)}`}`);
+  const headroom = r.backend && r.backend.next ? "headroom before the handoff" : "headroom after projection";
+  out.push("", `Dispatch: ${dispatchText(r)}${r.dispatch.headroom === null ? "" : `; ${headroom} ${pct(r.dispatch.headroom)}`}`);
   return `${out.join("\n")}\n`;
 }
 
@@ -101,11 +143,39 @@ function main(argv) {
     }
   }
   const now = process.env.BOT_CAPACITY_NOW ? Date.parse(process.env.BOT_CAPACITY_NOW) : Date.now();
-  const rate = readRate(now);
-  const since = new Date(rate ? rate.resetsAt - cap.WEEK_MS : now - cap.WEEK_MS).toISOString();
-  const weekTokens = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", "--json"])).totals.fresh_tokens;
+  let view = null;
+  try {
+    view = backends.backendView(now);
+  } catch (e) {
+    process.stderr.write(`${PROG}: ignoring the coordinator's backends: ${e.message}\n`);
+  }
+  const active = view && view.backends.find((b) => b.active);
+  let rate, costArgs = [];
+  if (active) {
+    rate = active.reading && active.window
+      ? { usedPercent: active.reading.used_percent, resetsAt: active.window.end, startsAt: active.window.start } : null;
+    if (active.source) costArgs = ["--source", active.source];
+  } else {
+    // The statusline's percent is the Claude plan's, so only Claude
+    // Code's tokens count: bot-cost counts opencode's too, wherever its
+    // database is.
+    rate = readRate(now);
+    if (rate) rate.startsAt = rate.resetsAt - cap.WEEK_MS;
+    costArgs = ["--source", "claude"];
+  }
+  const since = new Date(rate ? rate.startsAt : now - cap.WEEK_MS).toISOString();
+  const weekTokens = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", ...costArgs, "--json"])).totals.fresh_tokens;
   const items = JSON.parse(run(BOARD, ["list", "--json"]));
-  const report = cap.capacityReport({ rate, weekTokens, budget, items, now });
+  const backend = active && { name: active.name, leave_at: active.leave_at, available: active.available, why: active.why, next: view.next };
+  const report = cap.capacityReport({ rate, weekTokens, budget, items, now, backend });
+  if (active) {
+    report.no_reading = rate ? null : active.no_reading || (active.reading ? "its probe's window isn't known" : null);
+    report.config_error = view.config_error;
+    report.backends = view.backends.map((b) => ({
+      name: b.name, active: b.active, available: b.available, why: b.why, leave_at: b.leave_at,
+      used_percent: b.reading ? b.reading.used_percent : null, no_reading: b.no_reading,
+    }));
+  }
   process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report));
   return 0;
 }

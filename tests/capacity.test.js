@@ -1,7 +1,8 @@
-// Offline tests of lib/capacity.js (buckets, attribution, projection math)
-// and of bin/bot-actuals and bin/bot-capacity against fake bot-cost and
-// bot-board commands. Run with tests/capacity.sh, or node --test
-// tests/capacity.test.js.
+// Offline tests of lib/capacity.js (buckets, attribution, projection math),
+// lib/backends.js (backend windows and readings) and of bin/bot-actuals
+// and bin/bot-capacity against fake bot-cost and bot-board commands, and
+// a fake bot-coordinator-loop state. Run with tests/capacity.sh, or node
+// --test tests/capacity.test.js.
 "use strict";
 
 const assert = require("node:assert/strict");
@@ -14,6 +15,7 @@ const test = require("node:test");
 const BIN = path.join(__dirname, "..", "bin");
 const FIXTURES = path.join(__dirname, "fixtures", "bot-cost");
 const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const backends = require(path.join(__dirname, "..", "lib", "backends.js"));
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "capacity-test-"));
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
@@ -96,6 +98,46 @@ test("projection over a window of any length: Copilot's month, a 5-hour window",
   for (const [length, elapsed, want] of cases) {
     const q = cap.windowProjection({ usedPercent: 10, start: NOW - elapsed, end: NOW - elapsed + length, now: NOW });
     assert.equal(q.projected !== null, want, `${elapsed / HOUR}h of ${length / HOUR}h`);
+  }
+});
+
+test("backend windows: Claude's 7-day file probe, Copilot's calendar month", () => {
+  const t = (s) => Date.parse(s);
+  const now = t("2026-10-21T03:00:00Z");
+  const cases = [
+    ["7-day", { type: "file", window: "seven_day" }, t("2026-10-24T22:00:00Z"), [t("2026-10-17T22:00:00Z"), t("2026-10-24T22:00:00Z")]],
+    ["unknown file window", { type: "file", window: "fortnight" }, t("2026-10-24T22:00:00Z"), null],
+    ["file without a reset", { type: "file", window: "seven_day" }, null, null],
+    ["Copilot", { type: "copilot" }, t("2026-11-01T00:00:00Z"), [t("2026-10-01T00:00:00Z"), t("2026-11-01T00:00:00Z")]],
+    ["Copilot, no reading", { type: "copilot" }, null, [t("2026-10-01T00:00:00Z"), t("2026-11-01T00:00:00Z")]],
+    ["a shorter month before", { type: "copilot" }, t("2026-03-31T00:00:00Z"), [t("2026-02-28T00:00:00Z"), t("2026-03-31T00:00:00Z")]],
+    ["no probe", { type: "none" }, t("2026-11-01T00:00:00Z"), null],
+    ["a command's", { type: "command" }, t("2026-11-01T00:00:00Z"), null],
+  ];
+  for (const [what, probe, resets, want] of cases) {
+    const w = backends.windowOf(probe, resets, now);
+    assert.deepEqual(w && [w.start, w.end], want, what);
+  }
+});
+
+test("backend readings: fresh ones only, and why not", () => {
+  const iso = (ms) => new Date(ms).toISOString();
+  const fresh = { used_percent: 12, observed_at: iso(NOW - 60e3), resets_at: iso(NOW + DAY) };
+  const cases = [
+    ["fresh", fresh, 12, null],
+    ["a failed probe keeps a fresh reading", { ...fresh, probe_error: "timed out" }, 12, null],
+    ["no reading, a failed probe", { probe_error: "unexpected response", used_percent: null }, null, "probe: unexpected response"],
+    ["not probed yet", {}, null, "no reading yet"],
+    ["stale", { ...fresh, observed_at: iso(NOW - 2 * 3600e3) }, null, /^stale \(observed /],
+    ["stale, and the probe failing", { ...fresh, observed_at: iso(NOW - 2 * 3600e3), probe_error: "HTTP 500" }, null, /; probe: HTTP 500\)$/],
+    ["its window reset", { ...fresh, resets_at: iso(NOW - 1) }, null, /^its window reset at /],
+    ["no reset time", { ...fresh, resets_at: null }, 12, null],
+  ];
+  for (const [what, v, used, why] of cases) {
+    const r = backends.readingOf(v, NOW);
+    assert.equal(r.reading ? r.reading.used_percent : null, used, what);
+    if (why instanceof RegExp) assert.match(r.why, why, what);
+    else assert.equal(r.why, why, what);
   }
 });
 
@@ -231,7 +273,8 @@ test("bot-actuals sets Actual tokens on Done items without one; --dry-run only p
 
 test("bot-capacity reads the statusline file and reports the projection", () => {
   const rate = path.join(TMP, "rate-limits.json");
-  const base = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeBoard, BOT_CAPACITY_RATE_FILE: rate, BOT_CAPACITY_NOW: new Date(NOW).toISOString() };
+  const base = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeBoard, BOT_CAPACITY_RATE_FILE: rate, BOT_CAPACITY_NOW: new Date(NOW).toISOString(),
+    BOT_BACKEND_STATE: path.join(TMP, "no-backends.json") };
   const run = (args = [], env = {}) => execFileSync(path.join(BIN, "bot-capacity"), args, { env: { ...base, ...env }, encoding: "utf8" });
   fs.writeFileSync(rate, JSON.stringify({ observed_at: new Date(NOW - 60e3).toISOString(), seven_day: { used_percent: 40, resets_at: new Date(NOW + 3.5 * DAY).toISOString() } }));
   const r = JSON.parse(run(["--json"]));
@@ -262,4 +305,79 @@ test("bot-cost attributes a transcript to its Item: marker, with fresh tokens", 
   assert.equal(out.tasks[0].fresh_tokens, 60);
   assert.equal(out.totals.fresh_tokens, 60);
   assert.deepEqual(cap.attribute(out.tasks, ITEMS), { PVTI_b: 60 });
+});
+
+test("bot-capacity measures the coordinator's active backend", () => {
+  const state = path.join(TMP, "backend.json");
+  const toml = path.join(TMP, "backends.toml");
+  fs.writeFileSync(toml, [
+    "[[backend]]", 'name = "claude"', 'command = ["claude"]', "leave_at = 95",
+    'probe = { type = "file", path = "~/.cache/bot-heartbeat/rate-limits.json", window = "seven_day" }',
+    "[[backend]]", 'name = "opencode"', 'command = ["opencode"]', "leave_at = 90", "return_below = 40",
+    'probe = { type = "copilot", auth_env = "OPENCODE_AUTH_CONTENT" }', "",
+  ].join("\n"));
+  const iso = (ms) => new Date(ms).toISOString();
+  const view = (claude, opencode) => fs.writeFileSync(state, JSON.stringify({ version: 1, phase: "running", ...claude.state, view: { claude: claude.view, opencode } }));
+  const base = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeBoard, BOT_CAPACITY_NOW: iso(NOW),
+    BOT_BACKEND_STATE: state, BOT_BACKENDS_TOML: toml, BOT_CAPACITY_RATE_FILE: path.join(TMP, "none.json") };
+  const run = (args = [], env = {}) => execFileSync(path.join(BIN, "bot-capacity"), args, { env: { ...base, ...env }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const costLog = path.join(TMP, "cost.log");
+
+  // opencode coordinates, Claude being used up: 65% of the month by day
+  // 23 of 30 projects to 84.8%, P0 only below its 90%.
+  view({ state: { active: "opencode" }, view: { available: false, why: "at its threshold", used_percent: 96, observed_at: iso(NOW - 60e3), resets_at: iso(NOW + DAY) } },
+    { available: true, used_percent: 65, observed_at: iso(NOW - 60e3), resets_at: "2026-10-01T00:00:00Z" });
+  fs.rmSync(costLog, { force: true });
+  let r = JSON.parse(run(["--json"]));
+  assert.deepEqual([r.source, r.backend.name, r.backend.leave_at, r.backend.next], ["backend", "opencode", 90, null]);
+  assert.ok(Math.abs(r.projected - 65 * 30 / 23) < 1e-9);
+  assert.equal(r.dispatch.scope, "p0");
+  assert.match(fs.readFileSync(costLog, "utf8"), /--since 2026-09-01T00:00:00.000Z .*--source opencode/);
+  let out = run();
+  assert.match(out, /^Backends: claude \(unavailable: at its threshold\) 96\.0% used, leaves at 95%; opencode \(active\) 65\.0% used, leaves at 90%$/m);
+  assert.match(out, /^Window \(opencode's usage reading\): /m);
+  assert.match(out, /^Dispatch: P0 only \(projected at or above 80%\); opencode is the last available backend, used up at 90%; headroom after projection /m);
+
+  // Claude coordinates, its probe failing: no percent, unless a budget.
+  view({ state: { active: "claude" }, view: { available: true, probe_error: "unexpected response", used_percent: null } },
+    { available: true, used_percent: 3, observed_at: iso(NOW - 60e3), resets_at: "2026-10-01T00:00:00Z" });
+  fs.rmSync(costLog, { force: true });
+  out = run();
+  assert.match(out, /^Backends: claude \(active\) no reading \(probe: unexpected response\), leaves at 95%; opencode \(next\) 3\.0% used, leaves at 90%$/m);
+  assert.match(out, /^Window \(tokens only; no reading for claude: probe: unexpected response, and no budget\): /m);
+  assert.match(out, /^Dispatch: unknown \(no percent for claude: pass --budget\); opencode takes over at claude's 95%$/m);
+  assert.match(fs.readFileSync(costLog, "utf8"), /--since 2026-09-17T00:00:00.000Z .*--source claude/);
+  // 40M of 100M: 40%, 55% before the handoff.
+  r = JSON.parse(run(["--json", "--budget", "100000000"]));
+  assert.deepEqual([r.source, r.dispatch.scope], ["budget", "all"]);
+  assert.ok(Math.abs(r.dispatch.headroom - 55) < 1e-9);
+
+  // Without the config, the loop's default thresholds.
+  out = run([], { BOT_BACKENDS_TOML: path.join(TMP, "missing.toml") });
+  assert.match(out, /opencode \(next\) 3\.0% used, leaves at 95%$/m);
+  assert.match(out, /^ {2}\(thresholds are bot-coordinator-loop's defaults: no backends config/m);
+  // A state file that isn't JSON: measured as without backends, and said so.
+  fs.writeFileSync(state, "{oops");
+  assert.doesNotThrow(() => run());
+  assert.doesNotMatch(run(), /^Backends:/m);
+});
+
+test("bot-capacity without backends counts only Claude's tokens, with an opencode database there", () => {
+  const { makeOpencodeDb, tokens } = require(path.join(__dirname, "opencode-db.js"));
+  const home = path.join(TMP, "home");
+  const proj = path.join(home, ".claude", "projects", "p");
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, "s1.jsonl"), `${JSON.stringify({ type: "assistant", timestamp: "2026-09-23T10:00:00Z",
+    message: { id: "m1", model: "claude-opus-5-5", role: "assistant", content: [], usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 1000, cache_creation_input_tokens: 30 } } })}\n`);
+  const data = path.join(TMP, "data");
+  makeOpencodeDb(path.join(data, "opencode", "opencode.db"), [{ id: "ses_1", prompt: "Item: PVTI_x",
+    messages: [{ id: "msg_1", ts: "2026-09-23T11:00:00Z", model: "github-copilot/gpt-9", tokens: tokens(5000, 100, 0, 0, 0) }] }]);
+  const env = { ...process.env, HOME: home, XDG_CACHE_HOME: path.join(TMP, "cache"), XDG_DATA_HOME: data, XDG_STATE_HOME: path.join(TMP, "state"),
+    BOT_CAPACITY_BOARD: fakeBoard, BOT_CAPACITY_NOW: new Date(NOW).toISOString(), BOT_COST_NOW: new Date(NOW).toISOString(),
+    BOT_COST_MODELS_JSON: path.join(FIXTURES, "models.json"), BOT_BACKEND_STATE: path.join(TMP, "no-backends.json") };
+  delete env.BOT_CAPACITY_COST;
+  const r = JSON.parse(execFileSync(path.join(BIN, "bot-capacity"), ["--json"], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+  assert.equal(r.source, "tokens");
+  // The transcript's 60 fresh tokens, not opencode's 5100.
+  assert.equal(r.used_tokens, 60);
 });
