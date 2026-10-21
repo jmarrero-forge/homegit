@@ -211,16 +211,22 @@ to Todo or dispatch gets an **Est. cost** bucket, from the table in
 it shows the week's usage (the `seven_day` percent that `bot-heartbeat
 statusline` saves, else `--budget` tokens, else token totals), the burn
 rate, the percent projected at the reset, and the open P0/P1 estimates
-summed by bucket. Then:
+summed by bucket. Where the harness runs you on several backends and
+hands off between them at a usage threshold (`bot-coordinator-loop
+status`), it measures the active backend instead (its reading, window
+and tokens) and says which; while a next backend is available, its
+Dispatch line has no "P0 only" step and counts the headroom before the
+handoff, since workers still running then stop with this session. Then:
 
 - dispatch only while the projected usage plus the estimate of the work
   you are about to dispatch fits the remaining capacity (the report's
   `fits` column and headroom), P0 work first, then P1;
 - at about 80% projected (`bot-capacity` says "P0 only"), dispatch P0
-  work only, and tell the operator in the brief; at 100% dispatch nothing
-  new and let running workers finish;
+  work only, and tell the operator in the brief; when it says "nothing"
+  (100%, or the last available backend's threshold), dispatch nothing new
+  and let running workers finish;
 - when the projection is "too early in the week to say" (under 12 hours
-  of the window), go by the used percent;
+  of the window, or a 14th of a shorter one), go by the used percent;
 - with no percent at all ("unknown"), use the token totals and the
   operator's last word on the budget; don't guess one.
 
@@ -600,7 +606,8 @@ stop), `next_wake_at` when the running `bot-poll` gives up (its start plus
 devspace in its brief, with the `status` it last reported (`starting`,
 `working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
 is left out. `agent_ids` are the agentIds the Agent tool returned for the
-worker and its reviewer: publish reads their transcripts for the
+worker and its reviewer (under opencode, the task tool's task_ids):
+publish reads their transcripts for the
 worker's token total, and doesn't publish them. The heartbeat is
 public: names and links only, never task text. The plan's usage (the
 5-hour and 7-day percent from the status line, which must be

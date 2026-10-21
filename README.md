@@ -156,7 +156,13 @@ skill) and, once Done, their `Actual tokens`, which `bot-actuals` sums from
 the transcripts of workers whose prompt has an `Item: URL` line.
 `bot-capacity` shows the week's usage, burn rate and projection (from the
 percent `bot-heartbeat statusline` saves) next to the open P0/P1
-estimates, which the coordinator uses to decide what to dispatch.
+estimates, which the coordinator uses to decide what to dispatch. Where
+the coordinator runs on several backends (atomic-setup's
+`bot-coordinator-loop`, handing off from Claude Code to opencode at a
+usage threshold), it measures the active backend's reading and tokens
+instead, and its advice allows for the handoff (`lib/backends.js`).
+`bot-cost` and `bot-heartbeat` count opencode's sessions too, from its
+SQLite database (`lib/opencode.js`).
 
 `bot-heartbeat publish` puts the coordinator's loop state and its local
 workers (names, board item links, devspaces) in one pinned comment on
