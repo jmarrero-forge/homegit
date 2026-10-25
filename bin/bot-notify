@@ -106,6 +106,9 @@ readonly STATE_NAME=notifications
 readonly LOCAL_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-notify
 readonly FILED_FILE=${LOCAL_DIR}/filed.json
 readonly EVENTS_FILE=${LOCAL_DIR}/events.json
+# The security-related pings held (see SECURITY_REASONS): never on the
+# public board, so only here. Acked ones are kept ACKED_KEEP_DAYS.
+readonly HELD_FILE=${LOCAL_DIR}/held.json
 # Where the requests were kept before; merged into the board's on first
 # use.
 readonly LEGACY_PENDING_FILE=${LOCAL_DIR}/pending.json
@@ -129,6 +132,40 @@ readonly WHERE_JQ='def where: if .gist then "gist \(.gist)" else "\(.repo)#\(.nu
 readonly REDACT_JQ='def redact: if .private == false then . else del(.excerpt, .title) end;'
 # jq def that keeps "@login" in text from notifying anyone.
 readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@​");'
+# REQUESTER's rule: the bot never posts about a CVE or security advisory
+# it is pinged on, and tells him only in an interactive session. So a
+# security-related ping, whoever it is from (REQUESTER and the peers
+# included), is held: never filed in the issue repository, never a
+# request, answer, coordination question or board item, and kept out of
+# the public board's state. It is a 'security' record, its URL only,
+# printed by every run until 'ack URL', and remembered in HELD_FILE on
+# this machine, so it is held once. Detection errs toward holding: by the
+# thread's notification reason or subject type, by an advisory or alert
+# URL, or by its text (title or comment). Matched case-insensitively.
+readonly SECURITY_REASONS='["security_alert", "security_advisory_credit"]'
+readonly SECURITY_SUBJECT_TYPES='["RepositoryVulnerabilityAlert", "RepositoryAdvisory", "RepositoryDependabotAlertsThread", "SecurityAdvisory"]'
+readonly SECURITY_URL_RE='/security/(advisories|dependabot|code-scanning|secret-scanning)(/|$)|/security-advisories(/|$)|/dependabot/alerts(/|$)|/advisories/GHSA-'
+# CVE and GHSA ids, and the words of a disclosure.
+readonly SECURITY_TEXT_RE='CVE-[0-9]{4}-[0-9]{4,}|GHSA(-[0-9a-z]{4}){3}|security[ -]advisor|security (issue|bug|fix|flaw|hole|problem|report|disclosure)|vulnerab|embargo|zero[ -]day'
+# jq defs: whether a thread is security-related by its reason, type or
+# URLs (its text is checked per trigger), and whether a record is, by its
+# URLs or text ('text' being the trigger's whole body); the web page of a
+# thread held as a whole. They take the args in SECURITY_ARGS.
+readonly SECURITY_JQ='
+def security_url: any(.[]; type == "string" and test($sec_url; "i"));
+def security_text: any(.[]; type == "string" and test($sec_text; "i"));
+def security_thread: (.reason | IN($sec_reasons[])) or (.subject.type // "" | IN($sec_types[]))
+    or ([.subject.url, .subject.latest_comment_url] | security_url);
+def security_record: ([.url, .thread_url] | security_url) or ([.title, .excerpt, .text] | security_text);
+def held_url: (.subject.url // "") as $u
+    | if (.id | test("^https://")) then .id
+      elif ($u | test("^https://api\\.github\\.com/repos/[^/]+/[^/]+/(issues|pulls)/[0-9]+$")) then
+          $u | sub("^https://api\\.github\\.com/repos/"; "https://github.com/") | sub("/pulls/"; "/pull/")
+      elif ($u | test("^https://api\\.github\\.com/repos/[^/]+/[^/]+/security-advisories/[^/]+$")) then
+          $u | sub("^https://api\\.github\\.com/repos/"; "https://github.com/") | sub("/security-advisories/"; "/security/advisories/")
+      else "\(.repository.html_url)/security" end;'
+readonly SECURITY_ARGS=(--argjson sec_reasons "${SECURITY_REASONS}" --argjson sec_types "${SECURITY_SUBJECT_TYPES}"
+    --arg sec_url "${SECURITY_URL_RE}" --arg sec_text "${SECURITY_TEXT_RE}")
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
 # Returned by ghapi() when GitHub says the resource does not exist.
@@ -160,7 +197,7 @@ usage() {
     test -z "${COORDINATION_REPO}" || coordination="$(coordination_help)"$'\n'
     cat <<EOF
 Usage: $(basename "$0") [--dry-run] [--repo OWNER/REPO] [--no-mention]
-       $(basename "$0") ack THREAD_ID...
+       $(basename "$0") ack THREAD_ID|URL...
 
 Poll ${BOT_LOGIN}'s GitHub notifications once, and route every new
 mention, team mention, review request and assignment, and every new
@@ -172,6 +209,14 @@ ${TRACKER_REPO}) and searches for
 mentions of @${BOT_LOGIN} since the last poll; what that finds is routed
 the same way, as threads whose THREAD_ID is the issue or PR URL:
 
+  - anything security-related, from anyone (${REQUESTER} included): a
+    thread GitHub notifies for a security alert or advisory, an advisory
+    or alert URL, or a CVE or GHSA id or words like 'security advisory',
+    'vulnerability' or 'embargo' in its title or text. It is held: never
+    filed, acted on, answered or put on the board, nor kept in the board's
+    state; only a 'security' record with its URL is printed, for telling
+    ${REQUESTER} in an interactive session, by every run until 'ack URL'.
+    It is kept in ${HELD_FILE}, so it is held once;
   - an assignment by ${REQUESTER} (by GitHub login) in a public repository:
     add the issue or PR to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}, unless it is on it already;
   - any other ask by ${REQUESTER}: print a 'request' record, one JSON object
@@ -367,16 +412,23 @@ events_window=
 # Hidden test hook: another repository standing for TRACKER_REPO (a
 # throwaway one), with --from-file or --event-threads only.
 tracker_repo=${TRACKER_REPO}
+# is_ack_id ID: whether ID names a thread a request can be in.
+is_ack_id() {
+    is_thread_id "$1" || [[ "$1" =~ ^https://github\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$ ]] ||
+        [[ "$1" =~ ${GIST_URL_RE} ]]
+}
+
 subcmd=poll
 ack_ids=()
 if test "${1:-}" = ack; then
     subcmd=ack
     shift
-    test $# -gt 0 || fatal "usage: $(basename "$0") ack THREAD_ID..."
+    test $# -gt 0 || fatal "usage: $(basename "$0") ack THREAD_ID|URL..."
+    # Any other github.com URL may be a held security ping's, which is
+    # checked once they are loaded.
     for id in "$@"; do
-        is_thread_id "${id}" || [[ "${id}" =~ ^https://github\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$ ]] ||
-            [[ "${id}" =~ ${GIST_URL_RE} ]] ||
-            fatal "not a notification thread id, nor an issue, PR or gist URL: '${id}'"
+        is_ack_id "${id}" || [[ "${id}" =~ ^https://github\.com/ ]] ||
+            fatal "not a notification thread id, nor an issue, PR, gist or held security ping's URL: '${id}'"
     done
     ack_ids=("$@")
     set --
@@ -456,6 +508,9 @@ save_local() {
 
 # {filed: {TRIGGER_URL: issue URL}}
 FILED_JSON=$(load_local "${FILED_FILE}" filed)
+# {held: {KEY: {url, at}}, acked: {KEY: time}}: KEY is the trigger's URL,
+# or for a thread held as a whole "thread ID UPDATED_AT".
+HELD_JSON=$(load_local "${HELD_FILE}" held acked)
 
 # --- State on the board ---------------------------------------------------
 
@@ -539,6 +594,21 @@ mark_read() {
     esac
 }
 
+# is_held URL: whether a held security ping has that URL.
+is_held() {
+    jq -e --arg u "$1" 'any(.held[]; .url == $u)' <<<"${HELD_JSON}" >/dev/null
+}
+
+# print_held: prints the URL of every held security ping not acked yet,
+# one record per line.
+print_held() {
+    local n
+    n=$(jq '[.held[].url] | unique | length' <<<"${HELD_JSON}")
+    test "${n}" -gt 0 || return 0
+    echo "${n} security-related pings held: tell ${REQUESTER} about them in the interactive session only, never anywhere public; then 'bot-notify ack URL...':"
+    jq -r '[.held[].url] | unique[] | "security \({type: "security", url: .} | tojson)"' <<<"${HELD_JSON}"
+}
+
 # print_pending: prints every request not acked yet, one record per line.
 print_pending() {
     local n
@@ -554,6 +624,20 @@ if test "${subcmd}" = ack; then
     now=$(iso_now)
     rc=0
     for id in "${ack_ids[@]}"; do
+        is_ack_id "${id}" || is_held "${id}" ||
+            fatal "'${id}' is no notification thread id, nor an issue, PR or gist URL, and no security ping held here has that URL"
+    done
+    for id in "${ack_ids[@]}"; do
+        if is_held "${id}"; then
+            HELD_JSON=$(jq -c --arg u "${id}" --arg now "${now}" '
+                ([.held | to_entries[] | select(.value.url == $u) | .key]) as $keys
+                | .acked += ($keys | map({(.): $now}) | add // {})
+                | .held |= with_entries(select(.value.url != $u))' <<<"${HELD_JSON}")
+            save_local "${HELD_FILE}" "${HELD_JSON}"
+            echo "Acked the held security ping ${id}."
+            # The same URL can be a thread with requests too.
+            jq -e --arg id "${id}" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null || continue
+        fi
         n=$(jq --arg id "${id}" '[.pending[] | select(.thread_id == $id)] | length' <<<"${PENDING_JSON}")
         test "${n}" -gt 0 || warn "thread ${id} has no pending request; marking it read anyway"
         mark_read "${id}" || { rc=1; continue; }
@@ -571,8 +655,9 @@ if test "${subcmd}" = ack; then
     exit "${rc}"
 fi
 
-PENDING_JSON=$(jq -c --arg cutoff "$(date -u -d "${ACKED_KEEP_DAYS} days ago" +%FT%TZ)" \
-    '.acked |= with_entries(select(.value >= $cutoff))' <<<"${PENDING_JSON}")
+acked_cutoff=$(date -u -d "${ACKED_KEEP_DAYS} days ago" +%FT%TZ)
+PENDING_JSON=$(jq -c --arg cutoff "${acked_cutoff}" '.acked |= with_entries(select(.value >= $cutoff))' <<<"${PENDING_JSON}")
+HELD_JSON=$(jq -c --arg cutoff "${acked_cutoff}" '.acked |= with_entries(select(.value >= $cutoff))' <<<"${HELD_JSON}")
 
 # --- Poll position --------------------------------------------------------
 
@@ -709,7 +794,7 @@ safety_threads() {
         hits+=$'\n'$(ghapi --paginate "repos/${COORDINATION_REPO}/issues?state=all&since=${window}&per_page=100" \
             --jq "${COORDINATION_HITS_JQ}") || return 1
     fi
-    known=$(jq -c '[.pending, .acked | keys[]]' <<<"${PENDING_JSON}")
+    known=$(jq -c --slurpfile h <(printf '%s\n' "${HELD_JSON}") '[.pending, .acked, $h[0].held, $h[0].acked | keys[]]' <<<"${PENDING_JSON}")
     jq -sc --arg window "${window}" --slurpfile known <(printf '%s\n' "${known}") '$known[0] as $known | '"${HITS_TO_THREADS_JQ}" <<<"${hits}" |
         jq -sc --slurpfile threads <(printf '%s\n' "${threads}") '
             ($threads[0] | map("\(.repository.full_name)#\(.subject.url // "" | capture("/(?<n>[0-9]+)$").n // "")")) as $seen
@@ -942,7 +1027,7 @@ gist_triggers() {
                 | {reason: $reason, repo: null, private: ($g.public | not), number: null, gist: $g.id,
                    title: ($g.description // "" | if . == "" then ($g.files | keys | first) else . end),
                    thread_url: $g.html_url, thread_id: $g.html_url, author: .user.login, author_type: .user.type,
-                   url: "\($g.html_url)#gistcomment-\(.id)", excerpt: (.body | '"${excerpt_jq}"'),
+                   url: "\($g.html_url)#gistcomment-\(.id)", excerpt: (.body | '"${excerpt_jq}"'), text: .body,
                    located: true, question: false, choice: null}' || return 1
     done <<<"${gists}"
     GIST_STATE_NEW=${new_state}
@@ -976,7 +1061,7 @@ triage_triggers() {
             {reason: $reason, repo: $repo, private: false, number: (.number | tostring), title,
              thread_url: .html_url, thread_id: .html_url, author: .user.login, author_type: .user.type,
              url: (if $e then "\(.html_url)#event-\($e)" else .html_url end),
-             excerpt: ("\(.title)\n\n\(.body // "")" | '"${excerpt_jq}"'),
+             excerpt: ("\(.title)\n\n\(.body // "")" | '"${excerpt_jq}"'), text: "\(.title)\n\n\(.body // "")",
              located: ($e != null), question: false, choice: null}' <<<"${issue}"
     done <<<"${issues}"
 }
@@ -1110,6 +1195,19 @@ has_pending() {
     jq -e --arg id "$1" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null
 }
 
+# hold KEY URL: holds a security-related ping (see SECURITY_REASONS) at
+# URL, once: from now on every run prints its URL until 'ack URL'.
+hold() {
+    if jq -e --arg k "$1" '.held[$k] or .acked[$k]' <<<"${HELD_JSON}" >/dev/null; then
+        echo "  security-related, held already: $2"
+        return 0
+    fi
+    HELD_JSON=$(jq -c --arg k "$1" --arg u "$2" --arg now "$(iso_now)" '.held[$k] = {url: $u, at: $now}' <<<"${HELD_JSON}")
+    save_local "${HELD_FILE}" "${HELD_JSON}"
+    nheld=$((nheld + 1))
+    echo "  security-related: held for ${REQUESTER} in the interactive session only, never filed, answered or put on the board: $2"
+}
+
 # route_trigger RECORD AUTHOR_TYPE UNNOTIFIED: routes one trigger, given as
 # the record a request is kept as, by the kind of login GitHub recorded
 # for its author; UNNOTIFIED says only the safety net found it. Fails if
@@ -1117,6 +1215,13 @@ has_pending() {
 route_trigger() {
     local t=$1 url author
     url=$(jq -r .url <<<"${t}")
+    # Before anything else, whoever wrote it: nothing about it is posted.
+    if jq -e "${SECURITY_ARGS[@]}" "${SECURITY_JQ} security_record" <<<"${t}" >/dev/null; then
+        hold "${url}" "${url}"
+        return 0
+    fi
+    # Only needed for that.
+    t=$(jq -c 'del(.text)' <<<"${t}")
     author=$(jq -r '.author // "unknown"' <<<"${t}")
     # Only the login GitHub recorded counts, never what the text says.
     if test "$(jq -r .reason <<<"${t}")" = "${COORDINATION_REASON}" && is_peer "${author}" "$2"; then
@@ -1165,6 +1270,7 @@ nassigned=0
 nfiled=0
 nfailed=0
 nskipped=0
+nheld=0
 # New requests only the safety net found.
 nunnotified=0
 while IFS= read -r thread; do
@@ -1177,6 +1283,14 @@ while IFS= read -r thread; do
         continue
     fi
     nselected=$((nselected + 1))
+    # Held as a whole, without reading it, wherever it is.
+    if jq -e .security <<<"${thread}" >/dev/null; then
+        echo "Thread ${id}: a security alert or advisory"
+        hold "$(jq -r '"thread \(.id) \(.updated_at)"' <<<"${thread}")" \
+            "$(jq -r "${SECURITY_JQ}"' held_url' <<<"${thread}")"
+        mark_read "${id}" || nfailed=$((nfailed + 1))
+        continue
+    fi
     thread_repo=$(jq -r '.repository.full_name | ascii_downcase' <<<"${thread}")
     if test "$(jq -r .repository.owner.login <<<"${thread}")" = "${FORGE_ORG}" &&
         test "${thread_repo}" != "${tracker_repo,,}" && test "${thread_repo}" != "${COORDINATION_REPO,,}"; then
@@ -1202,7 +1316,7 @@ while IFS= read -r thread; do
             | {reason: \$th.reason, repo: \$th.repository.full_name, private: \$th.repository.private,
                number: ((\$th.subject.url // \"\" | capture(\"/(?<n>[0-9]+)\$\") | .n) // null),
                title: (\$th.subject.title // .issue_title), thread_url: (.url | sub(\"#.*\"; \"\")),
-               thread_id: \$th.id, author, url, excerpt: \$ex, located, question: (.question // false),
+               thread_id: \$th.id, author, url, excerpt: \$ex, text: .body, located, question: (.question // false),
                choice: ((.body // \"\") | split(\"\\n\") | (.[0] // \"\") | gsub(\"^\\\\s+|\\\\s+\$\"; \"\")
                         | if test(\"^[A-Z]\$\") then . else null end)}" <<<"${trig}")
         if jq -e '.private == null' <<<"${t}" >/dev/null; then
@@ -1225,11 +1339,12 @@ while IFS= read -r thread; do
         mark_read "${id}" || nfailed=$((nfailed + 1))
     fi
 done < <(jq -c --argjson reasons "${SELECT_REASONS}" --arg tracker "${tracker_repo,,}" --arg comment "${COMMENT_REASON}" \
-    --arg coord "${COORDINATION_REPO,,}" --arg coord_reason "${COORDINATION_REASON}" '
+    --arg coord "${COORDINATION_REPO,,}" --arg coord_reason "${COORDINATION_REASON}" "${SECURITY_ARGS[@]}" "${SECURITY_JQ}"'
     .[] | (.reason as $r | $reasons | index($r) != null) as $asks
     | (.repository.full_name | ascii_downcase) as $repo
-    | select($asks or $repo == $tracker or $repo == $coord)
-    | if $repo == $coord then .reason = $coord_reason elif $asks then . else .reason = $comment end' <<<"${threads_all}")
+    | .security = security_thread
+    | select($asks or $repo == $tracker or $repo == $coord or .security)
+    | if .security then . elif $repo == $coord then .reason = $coord_reason elif $asks then . else .reason = $comment end' <<<"${threads_all}")
 ! ${safety_failed} || nfailed=$((nfailed + 1))
 
 # Each gist is a thread, whose id is its URL.
@@ -1266,7 +1381,8 @@ fi
 
 filed_verb=filed
 ! ${dry_run} || filed_verb="to file"
-echo "Routed ${nselected} threads, ${ngist_comments} gist comments and ${ntriage} issues labelled ${TRIAGE_LABEL}: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${ncoordination} new coordination questions, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
+echo "Routed ${nselected} threads, ${ngist_comments} gist comments and ${ntriage} issues labelled ${TRIAGE_LABEL}: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${ncoordination} new coordination questions, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped, ${nheld} new security-related pings held."
+print_held
 print_pending
 if test "${nunnotified}" -gt 0; then
     warn "${nunnotified} new requests were only found by the safety net, not in ${BOT_LOGIN}'s notifications; check that its notification settings deliver 'On GitHub' for participating and watched activity"

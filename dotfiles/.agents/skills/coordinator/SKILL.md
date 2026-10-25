@@ -120,7 +120,7 @@ and compares what they list against what it has already reported:
 approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
 P0 drive lines (each new blocker of a P0 PR), operator activity lines
-(each event of the operator's to act on), sign-offs, requests, answers and coordination questions from
+(each event of the operator's to act on), sign-offs, requests, answers, coordination questions and held security pings from
 `bot-notify`, and item news other
 than bots'. A review, comment or sign-off is news once, by its id,
 whichever report lists it.
@@ -543,6 +543,10 @@ work is.
   action in Why, and resolve the ask). Keep chat replies to brief
   status, pointing at where each question or reply was posted rather
   than restating the options.
+- **Held security pings** (`security` records from `bot-notify`, the
+  first kind `bot-poll` shows): tell the operator their URLs in this
+  session, and nowhere else (no issue, comment, board item, morning
+  brief or heartbeat), then `bot-notify ack URL`.
 - **Coordination questions** (`coordination` records from `bot-notify`,
   shown by `bot-poll` as their own kind): the peer harness mentioning this
   bot, or opening an issue, in cgwalters-forge/harness-coordination, the

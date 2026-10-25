@@ -923,6 +923,33 @@ test_notify_private_scrubbed() {
         '{"excerpt":null,"title":null,"url":"U1"}' "the old private request"
 }
 
+test_notify_security_held() {
+    local url=https://github.com/o/r/issues/1#issuecomment-9 held=${XDG_STATE_HOME}/bot-notify/held.json
+    set_notify_state "$(gist_position)"
+    # His mention names a CVE: held, not a request, and kept off the board.
+    set_mention o/r false
+    jq '.[0].body = "@cgwalters-bot Please look at cve-2026-1111"' "${FAKE_GH}/rest/repos/o/r/issues/1/comments.json" >"${WORK}/c" &&
+        mv "${WORK}/c" "${FAKE_GH}/rest/repos/o/r/issues/1/comments.json"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out")" "{\"type\":\"security\",\"url\":\"${url}\"}" "the security record"
+    ! grep -q '^request ' "${WORK}/out" || fail "the held ping is a request too: $(cat "${WORK}/out")"
+    ! project_state notifications | grep -q 'issuecomment-9\|cve' || fail "the board's state names the held ping: $(project_state notifications)"
+    grep -q 'api -X PATCH notifications/threads/42' "${FAKE_GH}/calls" || fail "the held ping's thread wasn't marked read"
+    jq -e --arg u "${url}" '.held[$u].url == $u' "${held}" >/dev/null || fail "not held in ${held}: $(cat "${held}")"
+    # Seen again, it isn't held again, but it is printed until acked.
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "the second run failed: $(cat "${WORK}/out")"
+    grep -q '0 new security-related pings held' "${WORK}/out" || fail "held twice: $(cat "${WORK}/out")"
+    grep -qxF "security {\"type\":\"security\",\"url\":\"${url}\"}" "${WORK}/out" || fail "not printed again before the ack"
+    ! "${BIN}/bot-notify" ack https://github.com/o/r/security/advisories/GHSA-xxxx-xxxx-xxxx 2>/dev/null ||
+        fail "acked a URL that isn't held"
+    "${BIN}/bot-notify" ack "${url}" >"${WORK}/out" 2>&1 || fail "the ack failed: $(cat "${WORK}/out")"
+    grep -q 'Acked the held security ping' "${WORK}/out" || fail "no ack note: $(cat "${WORK}/out")"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "the third run failed: $(cat "${WORK}/out")"
+    ! grep -q '^security ' "${WORK}/out" || fail "an acked ping is still printed: $(cat "${WORK}/out")"
+    grep -q '0 new security-related pings held' "${WORK}/out" || fail "an acked ping was held again: $(cat "${WORK}/out")"
+    ! project_state notifications | grep -q 'issuecomment-9\|cve' || fail "the ack put the held ping on the board"
+}
+
 test_notify_gists_failed() {
     local c what gists
     gists=$(gist_position)
