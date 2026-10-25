@@ -271,6 +271,16 @@ for c in "${SECURITY_CASES[@]}"; do
         repository: {full_name: $repo, owner: {login: ($repo | split("/")[0])}, private: ($repo | startswith("secret/")),
                      html_url: "https://github.com/\($repo)"}}'
 done >"${WORK}/security-threads.json"
+# example/repo#39: a stranger's "me too", then a ping naming a CVE. One is
+# held, so both are: the whole thread is.
+jq -n '{number: 39, title: "Loader crash", html_url: "https://github.com/example/repo/issues/39", labels: [], body: ""}' |
+    api repos/example/repo/issues/39
+jq -n '[[3141, "stranger", "@cgwalters-bot me too"], [3142, "cgwalters", "@cgwalters-bot is CVE-2026-44444 fixed?"]]
+    | map({id: .[0], user: {login: .[1], type: "User"}, body: .[2], created_at: "2026-09-26T10:00:00Z",
+           updated_at: "2026-09-26T10:00:00Z", html_url: "https://github.com/example/repo/issues/39#issuecomment-\(.[0])"})' |
+    api repos/example/repo/issues/39/comments
+thread 314 mention example/repo 39 >>"${WORK}/security-threads.json"
+held_want+=(https://github.com/example/repo/issues/39#issuecomment-314{1,2})
 jq -s --slurpfile old "${WORK}/threads.json" '$old[0] + .' "${WORK}/security-threads.json" >"${WORK}/threads.all.json"
 mv "${WORK}/threads.all.json" "${WORK}/threads.json"
 
@@ -332,6 +342,10 @@ held_got=$(sed -n 's/^security //p' <<<"${out}" | jq -r 'if keys == ["type", "ur
 test "${held_got}" = "$(printf '%s\n' "${held_want[@]}" | sort)" ||
     fail "held ${held_got:-nothing}, not:"$'\n'"$(printf '%s\n' "${held_want[@]}")"$'\n'"${out}"
 grep -q "${#held_want[@]} new security-related pings held" <<<"${out}" || fail "the held pings weren't counted right:"$'\n'"${out}"
+# Nor are their titles printed.
+for title in "Loader crash" "Embargoed fix"; do
+    ! grep -F "${title}" <<<"${out}" >/dev/null || fail "a held thread's title was printed:"$'\n'"${out}"
+done
 # The held pings' threads and comments are in no other record.
 for url in "${held_want[@]}"; do
     if grep -F "${url}" <<<"${records}" >/dev/null; then

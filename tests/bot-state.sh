@@ -950,6 +950,179 @@ test_notify_security_held() {
     ! project_state notifications | grep -q 'issuecomment-9\|cve' || fail "the ack put the held ping on the board"
 }
 
+test_notify_security_thread_held() {
+    local held=${XDG_STATE_HOME}/bot-notify/held.json comments=${FAKE_GH}/rest/repos/o/r/issues/1/comments.json
+    local base=https://github.com/o/r/issues/1
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    # A stranger's ping, then one naming a CVE: both are held, nothing is
+    # filed, and the thread is held from now on.
+    jq '[{user: {login: "stranger", type: "User"}, body: "@cgwalters-bot me too", html_url: (.[0].html_url | sub("-9$"; "-8")),
+        created_at: "2026-09-23T23:30:00Z", updated_at: "2026-09-23T23:30:00Z"}] + map(.body = "@cgwalters-bot is CVE-2026-1111 fixed?")' \
+        "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out" | jq -r .url | sort | xargs)" "${base}#issuecomment-8 ${base}#issuecomment-9" "held pings"
+    ! grep -q '^request \|Issue title' "${WORK}/out" || fail "a held thread's ping is a request, or its title printed: $(cat "${WORK}/out")"
+    ! grep -q -- '-X POST repos/' "${FAKE_GH}/calls" || fail "filed something: $(cat "${FAKE_GH}/calls")"
+    jq -e '.threads["o/r#1"]' "${held}" >/dev/null || fail "the thread isn't held in ${held}: $(cat "${held}")"
+    # Acked, and later his and a stranger's ordinary pings there: held too.
+    "${BIN}/bot-notify" ack "${base}#issuecomment-8" "${base}#issuecomment-9" >/dev/null
+    jq --arg b "${base}" '. + [[10, "cgwalters"], [11, "stranger"]
+        | {user: {login: .[1], type: "User"}, body: "@cgwalters-bot Please look at this", html_url: "\($b)#issuecomment-\(.[0])",
+           created_at: "2026-09-24T00:0\(.[0] - 10):00Z", updated_at: "2026-09-24T00:0\(.[0] - 10):00Z"}]' \
+        "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+    jq '.[0].updated_at = "2026-09-24T00:01:00Z"' "${WORK}/threads.json" >"${WORK}/t" && mv "${WORK}/t" "${WORK}/threads.json"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "the second run failed: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out" | jq -r .url | sort | xargs)" "${base}#issuecomment-10 ${base}#issuecomment-11" \
+        "held pings in the held thread"
+    ! grep -q '^request \|Issue title' "${WORK}/out" || fail "a held thread's ping is a request, or its title printed: $(cat "${WORK}/out")"
+    ! grep -q -- '-X POST repos/' "${FAKE_GH}/calls" || fail "filed something: $(cat "${FAKE_GH}/calls")"
+    ! project_state notifications | grep -q 'issuecomment-1[01]' || fail "the board's state names a held ping: $(project_state notifications)"
+}
+
+test_notify_security_retitled() {
+    local comments=${FAKE_GH}/rest/repos/o/r/issues/1/comments.json held=${XDG_STATE_HOME}/bot-notify/held.json
+    local base=https://github.com/o/r/issues/1
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    # Held as a whole for its title...
+    jq '.[0].subject.title = "Embargoed fix for the loader"' "${WORK}/threads.json" >"${WORK}/t" && mv "${WORK}/t" "${WORK}/threads.json"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out" | jq -r .url)" "${base}" "the thread held whole"
+    jq -e '.threads["o/r#1"]' "${held}" >/dev/null || fail "the thread isn't held in ${held}: $(cat "${held}")"
+    # ...then retitled, with a stranger's "me too": still held, not filed.
+    jq --arg b "${base}" '. + [{user: {login: "stranger", type: "User"}, body: "@cgwalters-bot me too",
+        html_url: "\($b)#issuecomment-10", created_at: "2026-09-24T00:00:00Z", updated_at: "2026-09-24T00:00:00Z"}]' \
+        "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+    jq '.[0].subject.title = "Loader fix" | .[0].updated_at = "2026-09-24T00:01:00Z" | .[0].last_read_at = "2026-09-23T23:59:00Z"' \
+        "${WORK}/threads.json" >"${WORK}/t" && mv "${WORK}/t" "${WORK}/threads.json"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "the second run failed: $(cat "${WORK}/out")"
+    grep -qxF "security {\"type\":\"security\",\"url\":\"${base}#issuecomment-10\"}" "${WORK}/out" ||
+        fail "the later ping in the retitled thread isn't held: $(cat "${WORK}/out")"
+    ! grep -q '^request \|Loader fix' "${WORK}/out" || fail "a held thread's ping is a request, or its title printed: $(cat "${WORK}/out")"
+    ! grep -q -- '-X POST repos/' "${FAKE_GH}/calls" || fail "filed something: $(cat "${FAKE_GH}/calls")"
+}
+
+test_notify_security_pending_held() {
+    local comments=${FAKE_GH}/rest/repos/o/r/issues/1/comments.json filed=${XDG_STATE_HOME}/bot-notify/filed.json
+    local base=https://github.com/o/r/issues/1 issue=https://github.com/cgwalters-bot/cgwalters-bot/issues/5
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    # His ordinary ping is a request, kept in the board's state; an
+    # earlier one by someone else was filed.
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    grep -q '^request ' "${WORK}/out" || fail "no request: $(cat "${WORK}/out")"
+    project_state notifications | grep -q 'issuecomment-9' || fail "the request isn't in the board's state"
+    jq -nc --arg t "${base}#issuecomment-7" --arg i "${issue}" '{version: 1, filed: {($t): $i}}' >"${filed}"
+    # Then a ping there names a CVE: the request is held, and leaves the
+    # board's state; the filed issue is warned about.
+    jq --arg b "${base}" '. + [{user: {login: "stranger", type: "User"}, body: "@cgwalters-bot is CVE-2026-1111 fixed?",
+        html_url: "\($b)#issuecomment-10", created_at: "2026-09-24T00:00:00Z", updated_at: "2026-09-24T00:00:00Z"}]' \
+        "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+    jq '.[0].updated_at = "2026-09-24T00:01:00Z"' "${WORK}/threads.json" >"${WORK}/t" && mv "${WORK}/t" "${WORK}/threads.json"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "the second run failed: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out" | jq -r .url | sort | xargs)" "${base}#issuecomment-10 ${base}#issuecomment-9" "held pings"
+    ! grep -q '^request ' "${WORK}/out" || fail "the held request still prints as one: $(cat "${WORK}/out")"
+    ! project_state notifications | grep -q 'issuecomment-' || fail "the board's state names a held ping: $(project_state notifications)"
+    grep -qF "triggers filed publicly before: ${issue}" "${WORK}/out" || fail "no warning about the filed issue: $(cat "${WORK}/out")"
+}
+
+test_notify_security_pending_interrupted() {
+    local held=${XDG_STATE_HOME}/bot-notify/held.json url=https://github.com/o/r/issues/1#issuecomment-9
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    project_state notifications | grep -q 'issuecomment-9' || fail "the request isn't in the board's state"
+    # What a run killed before writing the state leaves: the thread held
+    # here, the request still in the board's state. A run with nothing
+    # new holds it anyway.
+    jq -nc '{version: 1, held: {}, acked: {}, threads: {"o/r#1": "2026-09-24T00:00:00Z"}}' >"${held}"
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1 || fail "the second run failed: $(cat "${WORK}/out")"
+    grep -q 'Nothing new since' "${WORK}/out" || fail "the second run had something new: $(cat "${WORK}/out")"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out" | jq -r .url)" "${url}" "the held request"
+    ! grep -q '^request ' "${WORK}/out" || fail "the held request still prints as one: $(cat "${WORK}/out")"
+    ! project_state notifications | grep -q 'issuecomment-9' || fail "the board's state names the held request: $(project_state notifications)"
+    jq -e --arg u "${url}" '.held[$u].url == $u' "${held}" >/dev/null || fail "not held in ${held}: $(cat "${held}")"
+}
+
+test_notify_security_check_fails() {
+    local jq_bin
+    jq_bin=$(command -v jq)
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    # If the check itself fails, his ordinary ping is held, not a request.
+    cat >"${WORK}/bin/jq" <<EOF
+#!/usr/bin/env bash
+for a; do
+    case "\${a}" in *'security_record or'*) echo "jq: error: simulated" 1>&2; exit 5 ;; esac
+done
+exec ${jq_bin} "\$@"
+EOF
+    chmod +x "${WORK}/bin/jq"
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    rm "${WORK}/bin/jq"
+    expect_eq "$(sed -n 's/^security //p' "${WORK}/out")" '{"type":"security","url":"https://github.com/o/r/issues/1#issuecomment-9"}' \
+        "the security record"
+    grep -q 'cannot tell whether a ping is security-related (jq status 5); holding it' "${WORK}/out" ||
+        fail "no warning about the failed check: $(cat "${WORK}/out")"
+    ! grep -q '^request ' "${WORK}/out" || fail "an unchecked ping is a request: $(cat "${WORK}/out")"
+}
+
+test_notify_security_hold_write_fails() {
+    local jq_bin held=${XDG_STATE_HOME}/bot-notify/held.json comments=${FAKE_GH}/rest/repos/o/r/issues/1/comments.json c pattern error
+    jq_bin=$(command -v jq)
+    # If recording the hold of the ping, or of its thread, fails (the jq
+    # program with PATTERN failing), the run stops with ERROR: the held
+    # pings aren't blanked, and the ping is neither a request nor in the
+    # board's state.
+    cat >"${WORK}/bin/jq" <<EOF
+#!/usr/bin/env bash
+for a; do
+    case "\${a}" in *"\${FAIL_JQ_PATTERN:-no such program}"*) echo "jq: error: simulated" 1>&2; exit 5 ;; esac
+done
+exec ${jq_bin} "\$@"
+EOF
+    chmod +x "${WORK}/bin/jq"
+    for c in '.held[$k] = {url: $u|recording the held ping .* failed' '.threads[$k] = $now|recording the held thread o/r#1 failed'; do
+        IFS='|' read -r pattern error <<<"${c}"
+        set_notify_state "$(gist_position)"
+        set_mention o/r false
+        jq '.[0].body = "@cgwalters-bot is CVE-2026-1111 fixed?"' "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+        mkdir -p "$(dirname "${held}")"
+        echo '{"version":1,"held":{"U0":{"url":"U0","at":"2026-09-20T00:00:00Z"}},"acked":{},"threads":{}}' >"${held}"
+        ! FAIL_JQ_PATTERN=${pattern} "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 ||
+            fail "${pattern}: bot-notify went on: $(cat "${WORK}/out")"
+        grep -q "${error}" "${WORK}/out" || fail "${pattern}: no error about the hold: $(cat "${WORK}/out")"
+        jq -e '.held == {"U0": {"url": "U0", "at": "2026-09-20T00:00:00Z"}}' "${held}" >/dev/null ||
+            fail "${pattern}: the held pings changed: $(cat "${held}")"
+        ! grep -q '^request ' "${WORK}/out" || fail "${pattern}: the ping is a request: $(cat "${WORK}/out")"
+        ! project_state notifications | grep -q 'issuecomment-9' ||
+            fail "${pattern}: the board's state names the ping: $(project_state notifications)"
+    done
+    rm "${WORK}/bin/jq"
+}
+
+test_notify_security_state_unwritable() {
+    local dir=${XDG_STATE_HOME}/bot-notify comments=${FAKE_GH}/rest/repos/o/r/issues/1/comments.json rc=0
+    set_notify_state "$(gist_position)"
+    set_mention o/r false
+    jq '.[0].body = "@cgwalters-bot is CVE-2026-1111 fixed?"' "${comments}" >"${WORK}/c" && mv "${WORK}/c" "${comments}"
+    # held.json can't be written: the run fails, rather than go on and
+    # forget the hold, and nothing reaches the requests or the board.
+    mkdir -p "${dir}" && : >"${dir}/lock" && chmod 555 "${dir}"
+    if test -w "${dir}"; then
+        chmod 755 "${dir}"
+        echo "skipped: ${dir} is writable even read-only (root?)"
+        return 0
+    fi
+    "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 || rc=$?
+    chmod 755 "${dir}"
+    test "${rc}" -ne 0 || fail "bot-notify went on: $(cat "${WORK}/out")"
+    grep -q "cannot write ${dir}/held.json" "${WORK}/out" || fail "no error about held.json: $(cat "${WORK}/out")"
+    ! grep -q '^request ' "${WORK}/out" || fail "the ping is a request: $(cat "${WORK}/out")"
+    ! project_state notifications | grep -q 'issuecomment-9' || fail "the board's state names the ping: $(project_state notifications)"
+}
+
 test_notify_gists_failed() {
     local c what gists
     gists=$(gist_position)
