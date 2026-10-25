@@ -200,7 +200,8 @@ fn is_host_label(s: &str) -> bool {
 }
 
 /// An https URL of a limited character set whose authority is a host name
-/// with an optional port 1-65535 (no userinfo). lib/operator.js's isUrl
+/// (its last label not all digits) with an optional port 1-65535 (no
+/// userinfo). lib/operator.js's isUrl
 /// must agree.
 fn is_url(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("https://") else {
@@ -223,7 +224,12 @@ fn is_url(s: &str) -> bool {
             && p.bytes().all(|c| c.is_ascii_digit())
             && p.parse::<u32>().is_ok_and(|n| (1..=MAX_PORT).contains(&n))
     });
-    port_ok && host.split('.').all(is_host_label)
+    // An all-digit last label is no domain name, and IPv4 literals aren't wanted.
+    let tld_ok = host
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| !tld.bytes().all(|c| c.is_ascii_digit()));
+    port_ok && tld_ok && host.split('.').all(is_host_label)
 }
 
 /// A lowercase name: host prefixes and state item and epic board names.
