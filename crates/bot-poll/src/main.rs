@@ -114,6 +114,9 @@ $BOT_POLL_BIN_DIR).
 
 From those outputs it takes the set of what is there now, per kind:
 
+  security      the security-related pings bot-notify holds, by URL until
+                they are acked: tell the operator in the session only,
+                never post about them
   approval      fork PRs 'bot-pr inbox' shows [APPROVED] (not \"APPROVED
                 earlier; new commits since\"), by their latest approval
   forge-review  the operator's reviews, comments and edits it lists on

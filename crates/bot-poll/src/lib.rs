@@ -50,7 +50,7 @@ impl Source {
     /// The seen-sets its output feeds.
     fn sets(self) -> &'static [&'static str] {
         match self {
-            Source::Notify => &["notify", "coordination"],
+            Source::Notify => &["security", "notify", "coordination"],
             Source::Inbox => &["approval", "forge-review"],
             Source::Watch => &[
                 "health",
@@ -128,8 +128,13 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 6] = [
 /// health-P0 is the new health lines of P0 PRs (they share the health
 /// seen-set); drive is the P0 PRs' new merge blockers (bot-drive);
 /// operator is what the operator did that the bot should act on
-/// (bot-operator-activity).
-pub const KINDS: [(&str, &str); 14] = [
+/// (bot-operator-activity); security is the security-related pings
+/// bot-notify holds, which are never to be posted about.
+pub const KINDS: [(&str, &str); 15] = [
+    (
+        "security",
+        "Held security pings (tell OPERATOR in this session only, never post about them)",
+    ),
     ("health-P0", "Priority health (P0)"),
     ("drive", "P0 drive"),
     ("operator", "OPERATOR'S activity to act on"),
@@ -312,16 +317,20 @@ pub fn parse_inbox(text: &str) -> Parsed {
 }
 
 /// bot-notify: the pending records, "request {JSON}" or "answer {JSON}"
-/// from the operator, and "coordination {JSON}" from the other harness,
-/// which go in a set of their own; listed on every run until acked.
+/// from the operator, and "coordination {JSON}" from the other harness
+/// and "security {JSON}" (a held ping's URL, and nothing else), which go
+/// in sets of their own; listed on every run until acked.
 pub fn parse_notify(text: &str) -> Parsed {
     let mut items = Vec::new();
     let mut coordination = Vec::new();
+    let mut security = Vec::new();
     for line in text.lines() {
         let Some((kind, json)) = line.split_once(' ') else {
             continue;
         };
-        if !matches!(kind, "request" | "answer" | "coordination") || !json.starts_with('{') {
+        if !matches!(kind, "request" | "answer" | "coordination" | "security")
+            || !json.starts_with('{')
+        {
             continue;
         }
         let Ok(r) = serde_json::from_str::<serde_json::Value>(json) else {
@@ -329,6 +338,15 @@ pub fn parse_notify(text: &str) -> Parsed {
             continue;
         };
         let field = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        if kind == "security" {
+            let url = field("url");
+            security.push(Item::new(
+                format!("{kind} {url}"),
+                url,
+                format!("held security ping: {url}"),
+            ));
+            continue;
+        }
         let url = [field("url"), field("thread_url")]
             .into_iter()
             .find(|s| !s.is_empty())
@@ -351,7 +369,11 @@ pub fn parse_notify(text: &str) -> Parsed {
             items.push(item);
         }
     }
-    Parsed::from([("notify", items), ("coordination", coordination)])
+    Parsed::from([
+        ("security", security),
+        ("notify", items),
+        ("coordination", coordination),
+    ])
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1075,6 +1097,52 @@ mod tests {
                 "request https://github.com/cgwalters-forge/harness-coordination/issues/1#issuecomment-12 https://github.com/cgwalters-forge/harness-coordination/issues/1"
             ]
         );
+    }
+
+    #[test]
+    fn notify_security_records() {
+        let advisory = "https://github.com/o/r/security/advisories/GHSA-aaaa-bbbb-cccc";
+        let comment = "https://github.com/o/r/issues/1#issuecomment-9";
+        let text = format!(
+            "2 security-related pings held: tell cgwalters about them in the interactive session only, never anywhere public; then 'bot-notify ack URL...':\n\
+             security {{\"type\":\"security\",\"url\":\"{advisory}\"}}\n\
+             security {{\"type\":\"security\",\"url\":\"{comment}\"}}\n"
+        );
+        let p = parse_notify(&text);
+        assert!(p["notify"].is_empty() && p["coordination"].is_empty());
+        assert_eq!(
+            keys(&p["security"]),
+            [
+                format!("security {advisory}"),
+                format!("security {comment}")
+            ]
+        );
+        assert_eq!(
+            p["security"]
+                .iter()
+                .map(|i| (i.url.as_str(), i.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (advisory, format!("held security ping: {advisory}").as_str()),
+                (comment, format!("held security ping: {comment}").as_str()),
+            ]
+        );
+        // News once, first of all kinds, and not again while it is listed
+        // until acked; a failed run's list is no news.
+        let mut o = outputs("base");
+        o.insert(
+            Source::Notify,
+            Output {
+                text: text.clone(),
+                status: Some(0),
+            },
+        );
+        let (news, seen) = eval(&o, &Memory::default(), 0);
+        assert_eq!(news[0].kind, "security");
+        assert_eq!(news[0].items.len(), 2);
+        assert!(!kinds(&eval(&o, &seen, 1000).0).contains(&"security"));
+        o.get_mut(&Source::Notify).unwrap().status = Some(1);
+        assert!(!kinds(&eval(&o, &Memory::default(), 0).0).contains(&"security"));
     }
 
     #[test]
