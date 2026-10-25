@@ -34,6 +34,14 @@ since the last check (a new comment updates its gist) and reads the new
 comments on those (`Gist comment on GIST_URL` in the output). Each
 trigger is routed as follows:
 
+- **Anything security-related**, from anyone, the operator included: a
+  security alert or advisory notification, an advisory URL, or a CVE or
+  GHSA id or words like "security advisory", "vulnerability" or
+  "embargo" in its title or text. It is held: never filed, answered or
+  put on the board, and kept out of the board's state; only a
+  `security` record with its URL is printed, by every run until
+  `bot-notify ack URL`. Tell the operator about it in the interactive
+  session only, never anywhere public, then ack it.
 - **An assignment by the operator login**, as recorded by GitHub (the `actor` of
   the `assigned` event whose `assignee` is cgwalters-bot), in a public
   repository: the script adds the issue or PR to the board itself, as
@@ -286,7 +294,9 @@ is an hour old, which bounds the window the safety net looks at. Next to
 the local lock, `filed.json` caches the triggers already filed as issues,
 checked before the lagging issue list, and `events.json` the ETag of
 the operator's events and what was found in them; losing either is harmless,
-since the issues carry markers and the events are just fetched again. A
+since the issues carry markers and the events are just fetched again.
+`held.json` holds the held security pings, which never go on the board,
+so on this machine only. A
 `pending.json` from before the board held the requests is merged in and
 moved to `pending.json.migrated` by the first run that writes.
 
