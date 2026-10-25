@@ -44,6 +44,7 @@ struct Raw {
     #[serde(default)]
     board: RawBoard,
     generated_by_url: Option<String>,
+    review_app_url: Option<String>,
     #[serde(default)]
     devspace: RawDevspace,
 }
@@ -94,6 +95,8 @@ pub struct Config {
     pub heartbeat_issue: Option<u64>,
     pub board: Board,
     pub generated_by_url: String,
+    /// Where the review app is published.
+    pub review_app_url: String,
     pub devspace: Devspace,
 }
 
@@ -275,6 +278,7 @@ fn validate(raw: &Raw) -> Result<()> {
         check(is_board_path(board), &format!("board.epics.{name}"), board)?;
     }
     check_opt(&raw.generated_by_url, "generated_by_url", is_url)?;
+    check_opt(&raw.review_app_url, "review_app_url", is_url)?;
     check_opt(&raw.devspace.repo, "devspace.repo", is_repo)?;
     check_opt(
         &raw.devspace.host_prefix,
@@ -361,6 +365,9 @@ fn resolve(raw: Raw) -> Result<Config> {
         generated_by_url: raw
             .generated_by_url
             .unwrap_or_else(|| format!("https://github.com/{}/#llms", operator.login)),
+        review_app_url: raw
+            .review_app_url
+            .unwrap_or_else(|| format!("https://{}.github.io/review/", forge_org.to_lowercase())),
         operator,
         bot,
         forge_org,

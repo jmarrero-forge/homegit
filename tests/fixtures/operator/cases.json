@@ -28,6 +28,7 @@
         }
       },
       "generated_by_url": "https://github.com/cgwalters/#llms",
+      "review_app_url": "https://cgwalters-forge.github.io/review/",
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
@@ -74,6 +75,55 @@
         "epics": {}
       },
       "generated_by_url": "https://github.com/jmarrero/#llms",
+      "review_app_url": "https://jmarrero-forge.github.io/review/",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox",
+        "host_prefix": "jmarrero-devspace-"
+      }
+    }
+  },
+  {
+    "name": "the review app published elsewhere",
+    "config": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot"
+      },
+      "forge_org": "jmarrero-forge",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox"
+      },
+      "review_app_url": "https://jmarrero.github.io/review/"
+    },
+    "expect": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot",
+        "git_name": "Joseph Marrero",
+        "git_email": "jmarrero+llm@example.com",
+        "issue_repo": "jmarrero-bot/jmarrero-bot",
+        "homegit_repo": "jmarrero-bot/homegit"
+      },
+      "forge_org": "jmarrero-forge",
+      "tracker_repo": "jmarrero-forge/tracker",
+      "heartbeat_issue": null,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "jmarrero-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {}
+      },
+      "generated_by_url": "https://github.com/jmarrero/#llms",
+      "review_app_url": "https://jmarrero.github.io/review/",
       "devspace": {
         "repo": "jmarrero-bot/jmarrero-devspace-sandbox",
         "host_prefix": "jmarrero-devspace-"
@@ -113,6 +163,7 @@
         }
       },
       "generated_by_url": "https://example.org/llm-policy",
+      "review_app_url": "https://jm.example.org/review/",
       "devspace": {
         "repo": "jm-bot/sandbox",
         "host_prefix": "jm-devspace-"
@@ -149,6 +200,7 @@
         }
       },
       "generated_by_url": "https://example.org/llm-policy",
+      "review_app_url": "https://jm.example.org/review/",
       "devspace": {
         "repo": "jm-bot/sandbox",
         "host_prefix": "jm-devspace-"
@@ -198,6 +250,7 @@
         }
       },
       "generated_by_url": "https://github.com/cgwalters/#llms",
+      "review_app_url": "https://cgwalters-forge.github.io/review/",
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
@@ -235,6 +288,7 @@
         "state_items": {}
       },
       "generated_by_url": "https://github.com/cgwalters/#llms",
+      "review_app_url": "https://cgwalters-forge.github.io/review/",
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
@@ -271,6 +325,7 @@
         "epics": {}
       },
       "generated_by_url": "https://github.com/cgwalters/#llms",
+      "review_app_url": "https://other-forge.github.io/review/",
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
@@ -310,6 +365,7 @@
         }
       },
       "generated_by_url": "https://github.com/someones/#llms",
+      "review_app_url": "https://cgwalters-forge.github.io/review/",
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
@@ -453,6 +509,12 @@
     "name": "http URL",
     "config": {
       "generated_by_url": "http://example.org/"
+    }
+  },
+  {
+    "name": "http review app URL",
+    "config": {
+      "review_app_url": "http://example.org/review/"
     }
   },
   {

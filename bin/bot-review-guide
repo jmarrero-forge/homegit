@@ -18,8 +18,8 @@ const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrE
 const BOT_LOGIN = CONFIG.bot.login;
 // Owners whose PRs the bot may post guides on.
 const POST_OWNERS = [CONFIG.forge_org, BOT_LOGIN];
-// The review app, which the forge org publishes.
-const APP_URL = `https://${CONFIG.forge_org.toLowerCase()}.github.io/review/`;
+// The review app (review_app_url, by default the forge org's Pages site).
+const APP_URL = CONFIG.review_app_url;
 
 const SEVERITIES = ["risky", "look-closely", "note"];
 const CATEGORIES = ["logic", "security", "error-handling", "test-gap", "api", "perf"];
