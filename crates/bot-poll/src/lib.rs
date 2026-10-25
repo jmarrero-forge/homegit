@@ -78,9 +78,18 @@ impl Source {
     /// lacks is really gone. bot-watch reports even when a URL or a
     /// section failed (exit 1): a report is whole once it has its
     /// closing "Swept" line, but for the sections its warnings say are
-    /// incomplete.
+    /// incomplete. bot-notify lists every held ping, from its local file,
+    /// after its summary line, even when a thread failed (exit 1), so
+    /// those are whole once it got that far (see [`notify_held_whole`]).
     fn whole_sets(self, text: &str, status: Option<i32>) -> Vec<&'static str> {
         match self {
+            Source::Notify if status != Some(0) => {
+                if status.is_some() && notify_held_whole(text) {
+                    vec!["security"]
+                } else {
+                    Vec::new()
+                }
+            }
             Source::Watch => {
                 let swept = text.lines().any(|l| {
                     l.strip_prefix("Swept ")
@@ -107,6 +116,34 @@ impl Source {
             _ => Vec::new(),
         }
     }
+}
+
+/// bot-notify's summary line ends so; the held pings come after it.
+const NOTIFY_SUMMARY_END: &str = " new security-related pings held.";
+/// The held pings' header: "N security-related pings held: ...".
+const NOTIFY_HELD_HEADER: &str = " security-related pings held: ";
+
+/// Whether a bot-notify run that didn't exit 0 listed its held pings in
+/// full: it got to its summary line, and the held pings' header, if any,
+/// counts as many as it lists (none without one), so that a run cut
+/// short in the middle of the list doesn't make the rest look acked.
+fn notify_held_whole(text: &str) -> bool {
+    let mut summary = false;
+    let mut want = 0;
+    let mut got = 0;
+    for line in text.lines() {
+        if line.starts_with("Routed ") && line.ends_with(NOTIFY_SUMMARY_END) {
+            summary = true;
+        } else if let Some((n, _)) = line.split_once(NOTIFY_HELD_HEADER) {
+            match n.parse::<usize>() {
+                Ok(n) => want = n,
+                Err(_) => return false,
+            }
+        } else if line.starts_with("security {") {
+            got += 1;
+        }
+    }
+    summary && want == got
 }
 
 /// bot-watch's warnings that a section is incomplete, and its sets.
@@ -1141,8 +1178,52 @@ mod tests {
         assert_eq!(news[0].kind, "security");
         assert_eq!(news[0].items.len(), 2);
         assert!(!kinds(&eval(&o, &seen, 1000).0).contains(&"security"));
+        // A run without its summary line is no news.
         o.get_mut(&Source::Notify).unwrap().status = Some(1);
         assert!(!kinds(&eval(&o, &Memory::default(), 0).0).contains(&"security"));
+    }
+
+    #[test]
+    fn notify_security_failed_run() {
+        let url = "https://github.com/o/r/issues/1#issuecomment-9";
+        let summary = "Routed 3 threads, 0 gist comments and 0 issues labelled needs-triage: 0 new requests and 0 assignments from cgwalters, 0 new coordination questions, 0 triggers by others filed, 0 skipped, 1 new security-related pings held.";
+        let header = "security-related pings held: tell cgwalters about them in the interactive session only, never anywhere public; then 'bot-notify ack URL...':";
+        let record = format!("security {{\"type\":\"security\",\"url\":\"{url}\"}}");
+        let request = r#"request {"url":"https://github.com/o/r/issues/2#issuecomment-1","thread_id":"7","author":"cgwalters"}"#;
+        let failed = "warning: cannot read what triggered thread 8; will retry next run";
+        let run = |text: String, status| {
+            let mut o = outputs("base");
+            o.insert(Source::Notify, Output { text, status });
+            o
+        };
+        // A thread failed (exit 1), but the run got through: its held
+        // pings are news, its requests aren't (they may be incomplete).
+        let whole = format!("{failed}\n{summary}\n1 {header}\n{record}\n{request}\n");
+        let (news, seen) = eval(&run(whole.clone(), Some(1)), &Memory::default(), 0);
+        assert_eq!(news[0].kind, "security");
+        assert_eq!(news[0].items[0].url, url);
+        assert!(!kinds(&news).contains(&"notify"), "{news:?}");
+        assert!(!kinds(&eval(&run(whole.clone(), Some(1)), &seen, 1000).0).contains(&"security"));
+        // Acked: an empty list is whole too, so the key is forgotten once
+        // it has been gone long enough.
+        let key = format!("security {url}");
+        let (_, acked) = eval(
+            &run(format!("{failed}\n{summary}\n"), Some(1)),
+            &seen,
+            FORGET_MS,
+        );
+        assert!(!acked.0["security"].contains_key(&key));
+        // Cut short in the list, killed, or failed before the summary:
+        // the list is not whole, so the key is kept as it was.
+        for (text, status) in [
+            (format!("{summary}\n2 {header}\n{record}\n"), Some(1)),
+            (format!("{summary}\n"), None),
+            (format!("{failed}\n"), Some(1)),
+        ] {
+            let (news, next) = eval(&run(text.clone(), status), &seen, FORGET_MS);
+            assert!(!kinds(&news).contains(&"security"), "{text}: {news:?}");
+            assert_eq!(next.0["security"], seen.0["security"], "{text}");
+        }
     }
 
     #[test]
