@@ -131,6 +131,54 @@
     }
   },
   {
+    "name": "a review app on a port",
+    "config": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot"
+      },
+      "forge_org": "jmarrero-forge",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox"
+      },
+      "review_app_url": "https://review.example.org:8443/app/"
+    },
+    "expect": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot",
+        "git_name": "Joseph Marrero",
+        "git_email": "jmarrero+llm@example.com",
+        "issue_repo": "jmarrero-bot/jmarrero-bot",
+        "homegit_repo": "jmarrero-bot/homegit"
+      },
+      "forge_org": "jmarrero-forge",
+      "tracker_repo": "jmarrero-forge/tracker",
+      "heartbeat_issue": null,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "jmarrero-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {}
+      },
+      "generated_by_url": "https://github.com/jmarrero/#llms",
+      "review_app_url": "https://review.example.org:8443/app/",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox",
+        "host_prefix": "jmarrero-devspace-"
+      }
+    }
+  },
+  {
     "name": "every key",
     "config": {
       "operator": {
@@ -515,6 +563,54 @@
     "name": "http review app URL",
     "config": {
       "review_app_url": "http://example.org/review/"
+    }
+  },
+  {
+    "name": "review app URL without a host",
+    "config": {
+      "review_app_url": "https://?"
+    }
+  },
+  {
+    "name": "review app URL with an empty host and a bad port",
+    "config": {
+      "review_app_url": "https://:bad"
+    }
+  },
+  {
+    "name": "review app URL with a port out of range",
+    "config": {
+      "review_app_url": "https://example.org:99999/"
+    }
+  },
+  {
+    "name": "review app URL with port 0",
+    "config": {
+      "review_app_url": "https://example.org:0/"
+    }
+  },
+  {
+    "name": "review app URL with userinfo",
+    "config": {
+      "review_app_url": "https://user@example.org/review/"
+    }
+  },
+  {
+    "name": "review app URL with a bad host label",
+    "config": {
+      "review_app_url": "https://-example.org/review/"
+    }
+  },
+  {
+    "name": "review app URL with an empty host label",
+    "config": {
+      "review_app_url": "https://example..org/"
+    }
+  },
+  {
+    "name": "generated_by_url without a host",
+    "config": {
+      "generated_by_url": "https://#llms"
     }
   },
   {

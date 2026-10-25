@@ -29,6 +29,7 @@ const BOT_EMAIL_TAG: &str = "llm";
 const OWNER_TYPES: [&str; 2] = ["orgs", "users"];
 const WORKSTREAM: &str = "workstream";
 const MAX_NUMBER: u64 = 1_000_000_000;
+const MAX_PORT: u32 = 65_535;
 
 /// The config file as written: every key optional.
 #[derive(Debug, Default, Deserialize)]
@@ -189,13 +190,40 @@ fn is_email(s: &str) -> bool {
     })
 }
 
+/// One label of a host name: 1-63 letters, digits and inner hyphens.
+fn is_host_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=63).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+}
+
+/// An https URL of a limited character set whose authority is a host name
+/// with an optional port 1-65535 (no userinfo). lib/operator.js's isUrl
+/// must agree.
 fn is_url(s: &str) -> bool {
-    s.strip_prefix("https://").is_some_and(|rest| {
-        (1..=500).contains(&rest.len())
-            && rest
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"._~:/?#@!&*+,;=%-".contains(&c))
-    })
+    let Some(rest) = s.strip_prefix("https://") else {
+        return false;
+    };
+    if !(1..=500).contains(&rest.len())
+        || !rest
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._~:/?#@!&*+,;=%-".contains(&c))
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len())
+            && p.bytes().all(|c| c.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=MAX_PORT).contains(&n))
+    });
+    port_ok && host.split('.').all(is_host_label)
 }
 
 /// A lowercase name: host prefixes and state item and epic board names.

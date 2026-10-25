@@ -164,6 +164,7 @@ config.
 
 `bot-cost` and `bot-retro` still name cgwalters' runner repositories and
 checkout path. The review app (cgwalters-forge/review) reads cgwalters'
-board and heartbeat issue, and `bot-review-guide` links to it as
-`https://FORGE.github.io/review/`, which another forge org doesn't have
-until it deploys its own copy.
+board and heartbeat issue, so another operator deploys a copy edited for
+their own and points `review_app_url` at it, which is where
+`bot-review-guide` links its guides (by default
+`https://FORGE.github.io/review/`).
