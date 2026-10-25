@@ -139,7 +139,10 @@ readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@​");'
 # request, answer, coordination question or board item, and kept out of
 # the public board's state. It is a 'security' record, its URL only,
 # printed by every run until 'ack URL', and remembered in HELD_FILE on
-# this machine, so it is held once. Detection errs toward holding: by the
+# this machine, so it is held once. Once one trigger in a thread is held,
+# the whole thread is, for good: every other trigger there, earlier in
+# the same run or later, is held too. Detection errs toward holding: an
+# error while checking holds the ping, and it matches by the
 # thread's notification reason or subject type, by an advisory or alert
 # URL (its own, or one in its text), by its repository (an advisory's
 # temporary private fork is named OWNER/REPO-ghsa-xxxx-xxxx-xxxx), by
@@ -160,7 +163,12 @@ readonly SECURITY_LABEL_RE='security|vulnerab|cve|ghsa|advisor|embargo'
 # threads can have such a title); whether a record is, by its URLs,
 # repository, text ('text' being the trigger's whole body, 'context' the
 # issue's) or labels; the web page of a thread held as a whole. They
-# take the args in SECURITY_ARGS.
+# take the args in SECURITY_ARGS. record_key and thread_key name the
+# thread a record or a notification thread is in, as held threads are
+# kept: "owner/repo#N" for an issue or PR, whichever URL form it comes
+# as, else the record's thread URL, but for a repository's own (a
+# trigger that couldn't be located), which would hold the whole
+# repository.
 readonly SECURITY_JQ='
 def security_url: any(.[]; type == "string" and test($sec_url; "i"));
 def security_text: any(.[]; type == "string" and test($sec_text; "i"));
@@ -168,6 +176,10 @@ def security_thread: (.reason | IN($sec_reasons[])) or (.subject.type // "" | IN
     or ([.subject.url, .subject.latest_comment_url] | security_url)
     or ([.repository.full_name, .subject.url] | security_text);
 def security_title: [.subject.title] | security_text;
+def issue_key($re): capture($re) | "\(.r | ascii_downcase)#\(.n)";
+def record_key: .thread_url // "" | first(issue_key("^https://github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)$"),
+    if test("^https://github\\.com/[^/]+/[^/]+/?$") then null else . end);
+def thread_key: .subject.url // "" | first(issue_key("^https://api\\.github\\.com/repos/(?<r>[^/]+/[^/]+)/(issues|pulls)/(?<n>[0-9]+)$"), null);
 def security_record: ([.url, .thread_url, .text, .context] | security_url)
     or ([.repo, .url, .thread_url, .title, .excerpt, .text, .context] | security_text)
     or any(.labels[]?; type == "string" and test($sec_label; "i"));
@@ -232,7 +244,11 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
     held: never filed, acted on, answered or put on the board, nor kept
     in the board's state; only a 'security' record with its URL is
     printed, for telling ${REQUESTER} in an interactive session, by every
-    run until 'ack URL'. It is kept in ${HELD_FILE}, so it is held once;
+    run until 'ack URL'. It is kept in ${HELD_FILE}, so it is held once.
+    Once one ping in a thread is held, so is every other one there, for
+    good (a request pending there already too, which leaves the board's
+    state; an issue filed about it before is warned about), and a ping
+    that can't be checked is held too;
   - an assignment by ${REQUESTER} (by GitHub login) in a public repository:
     add the issue or PR to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}, unless it is on it already;
   - any other ask by ${REQUESTER}: print a 'request' record, one JSON object
@@ -516,17 +532,21 @@ load_local() {
 }
 
 # save_local FILE JSON: atomically replaces FILE (not in a dry run).
+# Fatal if it can't: a held ping or thread that isn't recorded here
+# would be routed like any other by the next run.
 save_local() {
     ${dry_run} && return 0
-    printf '%s\n' "$2" >"$1.tmp.$$"
-    mv -f "$1.tmp.$$" "$1"
+    { printf '%s\n' "$2" >"$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; } ||
+        fatal "cannot write $1; its state would be lost"
 }
 
 # {filed: {TRIGGER_URL: issue URL}}
 FILED_JSON=$(load_local "${FILED_FILE}" filed)
-# {held: {KEY: {url, at}}, acked: {KEY: time}}: KEY is the trigger's URL,
-# or for a thread held as a whole "thread ID UPDATED_AT".
-HELD_JSON=$(load_local "${HELD_FILE}" held acked)
+# {held: {KEY: {url, at}}, acked: {KEY: time}, threads: {THREAD: time}}:
+# KEY is the trigger's URL, or for a thread held as a whole "thread ID
+# UPDATED_AT"; THREAD is a held thread's record_key (see SECURITY_JQ),
+# kept for good.
+HELD_JSON=$(load_local "${HELD_FILE}" held acked threads)
 
 # --- State on the board ---------------------------------------------------
 
@@ -635,6 +655,33 @@ print_pending() {
         | {type: (if .coordination then "coordination" elif .question then "answer" else "request" end)} + .
         | "\(.type) \(tojson)"' <<<"${PENDING_JSON}"
 }
+
+# hold_pending KEYS: holds the pending requests in the threads whose
+# record_keys (see SECURITY_JQ) the JSON array KEYS lists, so that they
+# leave the board's state and print only as 'security' records; sets
+# nmoved to how many. Held locally first: should the run stop before
+# the state is written, the next one moves them again.
+hold_pending() {
+    local urls now
+    urls=$(jq -c --argjson keys "$1" "${SECURITY_ARGS[@]}" "${SECURITY_JQ}"'
+        [.pending | to_entries[] | select(.value | record_key // "" | IN($keys[])) | .key]' <<<"${PENDING_JSON}") ||
+        fatal "finding the requests pending in held threads failed"
+    nmoved=$(jq length <<<"${urls}")
+    test "${nmoved}" -gt 0 || return 0
+    now=$(iso_now)
+    HELD_JSON=$(jq -c --arg now "${now}" --argjson urls "${urls}" \
+        '.held += ($urls | map({(.): {url: ., at: $now}}) | add)' <<<"${HELD_JSON}") ||
+        fatal "holding the requests pending in held threads failed"
+    save_local "${HELD_FILE}" "${HELD_JSON}"
+    PENDING_JSON=$(jq -c --argjson urls "${urls}" '.pending |= with_entries(select(.key | IN($urls[]) | not))' <<<"${PENDING_JSON}") ||
+        fatal "dropping the held requests from the pending ones failed"
+}
+
+# Requests in threads held already: an earlier run held them (or the
+# thread) locally but stopped before it wrote the state, which still has
+# them. Held on every run, before anything prints or writes requests.
+hold_pending "$(jq -c '.threads // {} | keys' <<<"${HELD_JSON}")"
+test "${nmoved}" -eq 0 || echo "${nmoved} requests pending in held threads are held now, and leave the board's state."
 
 if test "${subcmd}" = ack; then
     now=$(iso_now)
@@ -982,7 +1029,7 @@ triggers() {
     # is security-related.
     if test -n "${issue:-}"; then
         found=$(jq -c --argjson issue "${issue}" '. + {issue_body: ($issue.body // ""),
-            issue_labels: [$issue.labels[]? | if type == "object" then .name else . end | strings]}' <<<"${found}")
+            issue_labels: [$issue.labels[]? | if type == "object" then .name else . end | strings]}' <<<"${found}") || return 1
     fi
     printf '%s\n' "${found}"
 }
@@ -1114,7 +1161,8 @@ load_markers() {
 
 # record_filed TRIGGER_URL ISSUE_URL
 record_filed() {
-    FILED_JSON=$(jq -c --arg url "$1" --arg issue "$2" '.filed[$url] = $issue' <<<"${FILED_JSON}")
+    FILED_JSON=$(jq -c --arg url "$1" --arg issue "$2" '.filed[$url] = $issue' <<<"${FILED_JSON}") ||
+        fatal "recording the issue filed for $1 failed"
     save_local "${FILED_FILE}" "${FILED_JSON}"
 }
 
@@ -1122,9 +1170,10 @@ record_filed() {
 # other than REQUESTER.
 file_issue() {
     local t=$1 url existing title body
-    url=$(jq -r .url <<<"${t}")
+    # Called as a condition, where errexit is off: every step is checked.
+    url=$(jq -r .url <<<"${t}") || return 1
     # The local record first: the issue list lags behind a new issue.
-    existing=$(jq -r --arg url "${url}" '.filed[$url] // empty' <<<"${FILED_JSON}")
+    existing=$(jq -r --arg url "${url}" '.filed[$url] // empty' <<<"${FILED_JSON}") || return 1
     if test -z "${existing}"; then
         load_markers || return 1
         existing=$(awk -v url="${url}" '$1 == url { print $2; exit }' <<<"${filed_markers}")
@@ -1135,7 +1184,7 @@ file_issue() {
         return 0
     fi
     title=$(jq -r "${WHERE_JQ}"'"\({mention: "Mention", team_mention: "Team mention", review_requested: "Review request",
-                       assign: "Assignment", '"${GIST_REASON}"': "Gist comment", '"${COORDINATION_REASON}"': "Coordination comment"}[.reason] // "Notification"): \(if .author then "@" + .author else "someone" end) on \(where)"' <<<"${t}")
+                       assign: "Assignment", '"${GIST_REASON}"': "Gist comment", '"${COORDINATION_REASON}"': "Coordination comment"}[.reason] // "Notification"): \(if .author then "@" + .author else "someone" end) on \(where)"' <<<"${t}") || return 1
     if ${dry_run}; then
         echo "  would file: ${title}"
         nfiled=$((nfiled + 1))
@@ -1150,11 +1199,11 @@ file_issue() {
         // "notified the bot (\(.reason))") in \(where): \(.url)\n\nThread: \(.thread_url)"'
     if test "$(jq -r .private <<<"${t}")" = true ||
         { test "$(jq -r .repo <<<"${t}")" != null && is_private "$(jq -r .repo <<<"${t}")"; }; then
-        body=$(jq -r "${UNMENTION_JQ} ${WHERE_JQ} ${what}"' + "\n\nThe source is not public, so there is no excerpt here; read the thread."' <<<"${t}")
+        body=$(jq -r "${UNMENTION_JQ} ${WHERE_JQ} ${what}"' + "\n\nThe source is not public, so there is no excerpt here; read the thread."' <<<"${t}") || return 1
     else
         body=$(jq -r "${UNMENTION_JQ} ${WHERE_JQ} ${what}"' + " (\(.title | unmention))"
             + (if .excerpt != "" then "\n\n> \(.excerpt | unmention)" else "" end)
-            + (if .located then "" else "\n\nThe trigger could not be located; this is the latest comment in the thread." end)' <<<"${t}")
+            + (if .located then "" else "\n\nThe trigger could not be located; this is the latest comment in the thread." end)' <<<"${t}") || return 1
     fi
     body+=$'\n\n'"${BOT_LOGIN} does not act on requests from anyone but its operator; this is for a human to decide on."
     if ${mention}; then
@@ -1176,9 +1225,10 @@ readonly ITEM_STATUS_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2It
 # trusted login on the board, unless it is there already.
 add_assignment() {
     local t=$1 issue_url event_url author id status=
-    issue_url=$(jq -r .thread_url <<<"${t}")
-    event_url=$(jq -r .url <<<"${t}")
-    author=$(jq -r .author <<<"${t}")
+    # Called as a condition, where errexit is off: every step is checked.
+    issue_url=$(jq -r .thread_url <<<"${t}") || return 1
+    event_url=$(jq -r .url <<<"${t}") || return 1
+    author=$(jq -r .author <<<"${t}") || return 1
     if ${dry_run}; then
         echo "  would add ${issue_url} to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}"
         return 0
@@ -1204,12 +1254,14 @@ add_assignment() {
 
 # ack_trigger URL: remembers a trigger as handled.
 ack_trigger() {
-    PENDING_JSON=$(jq -c --arg url "$1" --arg now "$(iso_now)" '.acked[$url] = $now | del(.pending[$url])' <<<"${PENDING_JSON}")
+    PENDING_JSON=$(jq -c --arg url "$1" --arg now "$(iso_now)" '.acked[$url] = $now | del(.pending[$url])' <<<"${PENDING_JSON}") ||
+        fatal "recording $1 as acked failed"
 }
 
 # add_pending TRIGGER: keeps a request until 'ack' says it's on the board.
 add_pending() {
-    PENDING_JSON=$(jq -c --argjson t "$1" '.pending[$t.url] = $t' <<<"${PENDING_JSON}")
+    PENDING_JSON=$(jq -c --argjson t "$1" '.pending[$t.url] = $t' <<<"${PENDING_JSON}") ||
+        fatal "keeping a request failed"
 }
 
 # has_pending THREAD_ID: whether a request in that thread awaits an ack.
@@ -1224,22 +1276,97 @@ hold() {
         echo "  security-related, held already: $2"
         return 0
     fi
-    HELD_JSON=$(jq -c --arg k "$1" --arg u "$2" --arg now "$(iso_now)" '.held[$k] = {url: $u, at: $now}' <<<"${HELD_JSON}")
+    HELD_JSON=$(jq -c --arg k "$1" --arg u "$2" --arg now "$(iso_now)" '.held[$k] = {url: $u, at: $now}' <<<"${HELD_JSON}") ||
+        fatal "recording the held ping $2 failed"
     save_local "${HELD_FILE}" "${HELD_JSON}"
     nheld=$((nheld + 1))
     echo "  security-related: held for ${REQUESTER} in the interactive session only, never filed, answered or put on the board: $2"
 }
 
+# hold_thread KEY: holds every trigger in the thread with that record_key
+# (see SECURITY_JQ) from now on (none for an empty KEY), and its
+# requests pending from before (see hold_pending). Issues filed about it
+# already can't be taken back, so they are warned about.
+hold_thread() {
+    local k=$1 filed
+    test -n "${k}" || return 0
+    ! jq -e --arg k "${k}" '.threads[$k] != null' <<<"${HELD_JSON}" >/dev/null || return 0
+    HELD_JSON=$(jq -c --arg k "${k}" --arg now "$(iso_now)" '.threads[$k] = $now' <<<"${HELD_JSON}") ||
+        fatal "recording the held thread ${k} failed"
+    save_local "${HELD_FILE}" "${HELD_JSON}"
+    hold_pending "$(jq -nc --arg k "${k}" '[$k]')"
+    if test "${nmoved}" -gt 0; then
+        nheld=$((nheld + nmoved))
+        echo "  ${nmoved} requests pending there before are held now, and leave the board's state"
+    fi
+    filed=$(jq -r --arg k "${k}" "${SECURITY_ARGS[@]}" "${SECURITY_JQ}"'
+        [.filed | to_entries[] | select({thread_url: (.key | sub("#.*"; ""))} | record_key == $k) | .value]
+        | unique | join(" ")' <<<"${FILED_JSON}") ||
+        { warn "cannot tell which issues were filed about the held thread ${k}"; filed=; }
+    test -z "${filed}" ||
+        warn "a held thread had triggers filed publicly before: ${filed}; ${REQUESTER} may want them edited or deleted"
+}
+
+# is_security FILTER JSON: whether FILTER, given SECURITY_JQ and its args
+# and the held threads' keys as $held, is true of JSON. An error is a yes:
+# a ping that can't be checked is held.
+is_security() {
+    local rc=0
+    jq -e --slurpfile h <(printf '%s\n' "${HELD_JSON}") "${SECURITY_ARGS[@]}" \
+        "${SECURITY_JQ}"' ($h[0].threads // {}) as $held | '"$1" <<<"$2" >/dev/null || rc=$?
+    case "${rc}" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *)
+            warn "cannot tell whether a ping is security-related (jq status ${rc}); holding it"
+            return 0
+            ;;
+    esac
+}
+
+# Whether a record is security-related, or in a held thread.
+readonly RECORD_HELD_JQ='security_record or $held[record_key // ""] != null'
+# Whether a notification thread is a held one. Only its triggers are held
+# (see RECORD_HELD_JQ): any update to an issue updates its thread.
+readonly THREAD_HELD_JQ='thread_key as $k | $k != null and $held[$k] != null'
+
+# record_key RECORD: prints its thread's record_key (see SECURITY_JQ), or
+# nothing if it has none. Fatal if that can't be told.
+record_key() {
+    jq -r "${SECURITY_JQ}"' record_key // empty' <<<"$1" || fatal "cannot tell which thread a ping is in"
+}
+
+# hold_threads RECORD...: holds the thread of each security-related
+# record before any of them is routed, so that none in that thread is
+# filed or kept, whatever their order; sets held_any to whether any is.
+# Never called as a condition, so that errexit holds inside it.
+hold_threads() {
+    local t k
+    held_any=false
+    for t in "$@"; do
+        test -n "${t}" || continue
+        is_security "${RECORD_HELD_JQ}" "${t}" || continue
+        k=$(record_key "${t}")
+        hold_thread "${k}"
+        held_any=true
+    done
+}
+
 # route_trigger RECORD AUTHOR_TYPE UNNOTIFIED: routes one trigger, given as
 # the record a request is kept as, by the kind of login GitHub recorded
-# for its author; UNNOTIFIED says only the safety net found it. Fails if
-# filing it or adding it to the board failed.
+# for its author; UNNOTIFIED says only the safety net found it. Sets
+# route_ok to false if filing it or adding it to the board failed (to
+# retry). Never called as a condition, so that errexit holds inside it:
+# anything else failing on the way, holding a ping above all, ends the
+# run before the state is written.
 route_trigger() {
-    local t=$1 url author
+    local t=$1 url author k
     url=$(jq -r .url <<<"${t}")
     # Before anything else, whoever wrote it: nothing about it is posted.
-    if jq -e "${SECURITY_ARGS[@]}" "${SECURITY_JQ} security_record" <<<"${t}" >/dev/null; then
+    if is_security "${RECORD_HELD_JQ}" "${t}"; then
         hold "${url}" "${url}"
+        k=$(record_key "${t}")
+        hold_thread "${k}"
         return 0
     fi
     # Only needed for that.
@@ -1259,13 +1386,13 @@ route_trigger() {
         fi
     elif ! is_trusted "${author}" "$2"; then
         echo "  from @${author} (not ${REQUESTER}): filing, never acting on it"
-        file_issue "${t}" || return 1
+        file_issue "${t}" || { route_ok=false; return 0; }
     elif jq -e --arg url "${url}" '.acked[$url]' <<<"${PENDING_JSON}" >/dev/null; then
         echo "  request ${url} already acked"
     elif test "$(jq -r .reason <<<"${t}")" = assign && jq -e '.located' <<<"${t}" >/dev/null &&
         ! { test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; }; then
         echo "  assigned by @${author}"
-        add_assignment "${t}" || return 1
+        add_assignment "${t}" || { route_ok=false; return 0; }
         ack_trigger "${url}"
         nassigned=$((nassigned + 1))
     elif jq -e --arg url "${url}" '.pending[$url]' <<<"${PENDING_JSON}" >/dev/null; then
@@ -1295,6 +1422,17 @@ nskipped=0
 nheld=0
 # New requests only the safety net found.
 nunnotified=0
+# The threads to route. If this fails, none would be (and the poll
+# position would move past them).
+selected=$(jq -c --argjson reasons "${SELECT_REASONS}" --arg tracker "${tracker_repo,,}" --arg comment "${COMMENT_REASON}" \
+    --arg coord "${COORDINATION_REPO,,}" --arg coord_reason "${COORDINATION_REASON}" "${SECURITY_ARGS[@]}" "${SECURITY_JQ}"'
+    .[] | (.reason as $r | $reasons | index($r) != null) as $asks
+    | (.repository.full_name | ascii_downcase) as $repo
+    | .security = security_thread
+    | select($asks or $repo == $tracker or $repo == $coord or .security)
+    | .security = (.security or security_title)
+    | if .security then . elif $repo == $coord then .reason = $coord_reason elif $asks then . else .reason = $comment end' <<<"${threads_all}") ||
+    fatal "selecting the notification threads to route failed"
 while IFS= read -r thread; do
     test -n "${thread}" || continue
     id=$(jq -r .id <<<"${thread}")
@@ -1306,10 +1444,15 @@ while IFS= read -r thread; do
     fi
     nselected=$((nselected + 1))
     # Held as a whole, without reading it, wherever it is.
-    if jq -e .security <<<"${thread}" >/dev/null; then
+    if is_security .security "${thread}"; then
         echo "Thread ${id}: security-related"
-        hold "$(jq -r '"thread \(.id) \(.updated_at)"' <<<"${thread}")" \
-            "$(jq -r "${SECURITY_JQ}"' held_url' <<<"${thread}")"
+        key=$(jq -r '"thread \(.id) \(.updated_at)"' <<<"${thread}")
+        held_url=$(jq -r "${SECURITY_JQ}"' held_url' <<<"${thread}")
+        hold "${key}" "${held_url}"
+        # So that its later pings are held too, even once it no longer
+        # looks security-related (retitled, say).
+        key=$(jq -r "${SECURITY_JQ}"' thread_key // empty' <<<"${thread}")
+        hold_thread "${key}"
         mark_read "${id}" || nfailed=$((nfailed + 1))
         continue
     fi
@@ -1321,16 +1464,15 @@ while IFS= read -r thread; do
         mark_read "${id}" || nfailed=$((nfailed + 1))
         continue
     fi
-    echo "Thread ${desc}"
     if ! found=$(triggers "${thread}"); then
         warn "cannot read what triggered thread ${id}; will retry next run"
         nfailed=$((nfailed + 1))
         continue
     fi
-    if test -z "${found}"; then
-        echo "  nothing new for the bot since it was last read"
-    fi
-    ok=true
+    # Every trigger's record first, so that one security-related trigger
+    # holds them all.
+    records=()
+    author_types=()
     while IFS= read -r trig; do
         test -n "${trig}" || continue
         # Everything a record or an issue needs, in one object.
@@ -1347,10 +1489,26 @@ while IFS= read -r thread; do
             ! is_private "$(jq -r .repo <<<"${t}")" || priv=true
             t=$(jq -c --argjson p "${priv}" '.private = $p' <<<"${t}")
         fi
-        route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" "$(jq -e .source <<<"${thread}" >/dev/null && echo true || echo false)" ||
-            ok=false
+        records+=("${t}")
+        author_types+=("$(jq -r '.author_type // ""' <<<"${trig}")")
     done <<<"${found}"
-    if ! ${ok}; then
+    # Its title only for a thread not held.
+    hold_threads "${records[@]}"
+    if ${held_any} || is_security "${THREAD_HELD_JQ}" "${thread}"; then
+        echo "Thread ${id}: security-related"
+    else
+        echo "Thread ${desc}"
+    fi
+    if test -z "${found}"; then
+        echo "  nothing new for the bot since it was last read"
+    fi
+    unnotified=false
+    ! jq -e .source <<<"${thread}" >/dev/null || unnotified=true
+    route_ok=true
+    for i in "${!records[@]}"; do
+        route_trigger "${records[i]}" "${author_types[i]}" "${unnotified}"
+    done
+    if ! ${route_ok}; then
         nfailed=$((nfailed + 1))
     elif has_pending "${id}"; then
         if is_thread_id "${id}"; then
@@ -1361,25 +1519,30 @@ while IFS= read -r thread; do
     else
         mark_read "${id}" || nfailed=$((nfailed + 1))
     fi
-done < <(jq -c --argjson reasons "${SELECT_REASONS}" --arg tracker "${tracker_repo,,}" --arg comment "${COMMENT_REASON}" \
-    --arg coord "${COORDINATION_REPO,,}" --arg coord_reason "${COORDINATION_REASON}" "${SECURITY_ARGS[@]}" "${SECURITY_JQ}"'
-    .[] | (.reason as $r | $reasons | index($r) != null) as $asks
-    | (.repository.full_name | ascii_downcase) as $repo
-    | .security = security_thread
-    | select($asks or $repo == $tracker or $repo == $coord or .security)
-    | .security = (.security or security_title)
-    | if .security then . elif $repo == $coord then .reason = $coord_reason elif $asks then . else .reason = $comment end' <<<"${threads_all}")
+done <<<"${selected}"
 ! ${safety_failed} || nfailed=$((nfailed + 1))
 
 # Each gist is a thread, whose id is its URL.
+# Every comment's thread is held first, so that one security-related
+# comment holds the others on its gist, and titles are printed only for
+# what isn't held; likewise for the issues to triage.
 if gist_triggers >"${scratch}/gist-triggers"; then
+    mapfile -t records <"${scratch}/gist-triggers"
+    hold_threads "${records[@]}"
     while IFS= read -r trig; do
         test -n "${trig}" || continue
         ngist_comments=$((ngist_comments + 1))
         t=$(jq -c 'del(.author_type)' <<<"${trig}")
         id=$(jq -r .thread_id <<<"${t}")
-        echo "Gist comment on ${id}: $(jq -r .title <<<"${t}")"
-        if ! route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" false; then
+        if is_security "${RECORD_HELD_JQ}" "${t}"; then
+            echo "Gist comment on ${id}: security-related"
+        else
+            echo "Gist comment on ${id}: $(jq -r .title <<<"${t}")"
+        fi
+        author_type=$(jq -r '.author_type // ""' <<<"${trig}")
+        route_ok=true
+        route_trigger "${t}" "${author_type}" false
+        if ! ${route_ok}; then
             nfailed=$((nfailed + 1))
         elif has_pending "${id}"; then
             echo "  kept until 'bot-notify ack ${id}'"
@@ -1391,12 +1554,21 @@ else
 fi
 
 if triage_triggers >"${scratch}/triage-triggers"; then
+    mapfile -t records <"${scratch}/triage-triggers"
+    hold_threads "${records[@]}"
     while IFS= read -r trig; do
         test -n "${trig}" || continue
         ntriage=$((ntriage + 1))
         t=$(jq -c 'del(.author_type)' <<<"${trig}")
-        echo "To triage: $(jq -r '"\(.title) [\(.thread_id)]"' <<<"${t}")"
-        route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" false || nfailed=$((nfailed + 1))
+        if is_security "${RECORD_HELD_JQ}" "${t}"; then
+            echo "To triage: security-related [$(jq -r .thread_id <<<"${t}")]"
+        else
+            echo "To triage: $(jq -r '"\(.title) [\(.thread_id)]"' <<<"${t}")"
+        fi
+        author_type=$(jq -r '.author_type // ""' <<<"${trig}")
+        route_ok=true
+        route_trigger "${t}" "${author_type}" false
+        ${route_ok} || nfailed=$((nfailed + 1))
     done <"${scratch}/triage-triggers"
 else
     warn "listing the ${tracker_repo} issues labelled ${TRIAGE_LABEL} failed"
