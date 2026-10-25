@@ -150,7 +150,8 @@ it was last there, so a sweep that missed it (a failed read) doesn't make
 it news again; after that it is forgotten. An incomplete output (bot-notify
 or bot-pr inbox failing, bot-watch without its closing \"Swept\" line, or
 a section its warnings say is incomplete) leaves those seen-sets as they
-are.
+are. bot-notify's held pings are whole once it printed its summary line,
+even if a thread failed.
 
 Each sweep also rebuilds the hot set, where the operator is likely to
 act soon: the bot's open PRs in the forge org (fork PRs awaiting his
