@@ -46,6 +46,7 @@ forge org, and the rest is derived:
 | `board.state_items` | none (bot-board knows cgwalters' board's) | ids of the archived `bot-state:` items; see below |
 | `board.epics` | `composefs-stable` for cgwalters' board, else none | milestone boards, by `bot-board --project` name; `bot-priority-health` sweeps the first |
 | `generated_by_url` | `https://github.com/OPERATOR/#llms` | the `Generated-by:` line `bot-pr fork-pr` expects in PR bodies |
+| `review_app_url` | `https://FORGE.github.io/review/` (`forge_org` lowercased) | the review app that `bot-review-guide` links its guides to |
 | `devspace.repo` | `bootc-dev/cgwalters-devspace-sandbox` | the repository whose `devspace.yml` `bot-devspace` dispatches, and `bot-runs` reads |
 | `devspace.host_prefix` | the repository's name without `-sandbox`, plus `-` | the runners' MagicDNS host names, `PREFIX` + run id |
 
