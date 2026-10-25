@@ -608,6 +608,18 @@
     }
   },
   {
+    "name": "review app URL with an all-digit last label",
+    "config": {
+      "review_app_url": "https://example.123/"
+    }
+  },
+  {
+    "name": "review app URL with an IPv4 literal",
+    "config": {
+      "review_app_url": "https://999.999.999.999/"
+    }
+  },
+  {
     "name": "generated_by_url without a host",
     "config": {
       "generated_by_url": "https://#llms"
