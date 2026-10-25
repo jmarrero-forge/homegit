@@ -217,31 +217,52 @@ thread() {
 } | jq -s . >"${WORK}/threads.json"
 
 # Security-related pings, one per line: THREAD_ID|REASON|REPO|NUMBER|TYPE|
-# SUBJECT_URL|TITLE|AUTHOR|COMMENT|HELD. With a NUMBER, the thread is
-# that issue, with one comment (id THREAD_ID) by AUTHOR. HELD is the URL
-# of the 'security' record it must make, or - for a ping that is filed.
+# SUBJECT_URL|TITLE|AUTHOR|COMMENT|HELD[|ISSUE_BODY|LABELS]. With a
+# NUMBER, the thread is that issue, with ISSUE_BODY, the comma-separated
+# LABELS and one comment (id THREAD_ID) by AUTHOR, in which '\n' is a
+# line break. HELD is the URL of the 'security' record it must make, or
+# - for a ping that is filed or not routed at all.
 # The CVE is past the excerpt's 300 characters.
 filler=$(printf 'x%.0s' {1..320})
+readonly ADVISORY_FORK=example/repo-ghsa-abcd-23fg-wxyz
 readonly SECURITY_CASES=(
     "301|mention|example/repo|30|Issue||Crash on boot|stranger|@cgwalters-bot ${filler} is CVE-2026-12345 fixed?|https://github.com/example/repo/issues/30#issuecomment-301"
     "302|mention|example/repo|31|Issue||Update deps|cgwalters|@cgwalters-bot look at ghsa-abcd-23fg-wxyz first|https://github.com/example/repo/issues/31#issuecomment-302"
     "303|security_advisory_credit|example/repo||RepositoryAdvisory|https://api.github.com/repos/example/repo/security-advisories/GHSA-aaaa-bbbb-cccc|Credit|||https://github.com/example/repo/security/advisories/GHSA-aaaa-bbbb-cccc"
     "304|security_alert|example/repo||RepositoryDependabotAlertsThread||Alerts|||https://github.com/example/repo/security"
     "305|mention|secret/repo||RepositoryAdvisory||Draft|||https://github.com/secret/repo/security"
-    "306|mention|secret/repo|7|Issue||Embargoed fix for the loader|cgwalters|@cgwalters-bot can you prepare this?|https://github.com/secret/repo/issues/7#issuecomment-306"
-    "307|mention|example/repo|33|Issue||Docs|stranger|@cgwalters-bot please update the security docs|-"
+    # Its title holds the whole thread, unread.
+    "306|mention|secret/repo|7|Issue||Embargoed fix for the loader|cgwalters|@cgwalters-bot can you prepare this?|https://github.com/secret/repo/issues/7"
+    "307|mention|example/repo|33|Issue||Docs|stranger|@cgwalters-bot please update the security docs|-||docs,P2"
+    # An advisory's temporary private fork, whatever the text.
+    "308|mention|${ADVISORY_FORK}|1|PullRequest||Fix the loader|stranger|@cgwalters-bot please review|https://github.com/${ADVISORY_FORK}/issues/1"
+    # The issue's body or labels, not the ping.
+    "309|mention|example/repo|34|Issue||Loader crash|cgwalters|@cgwalters-bot take a look|https://github.com/example/repo/issues/34#issuecomment-309|Reported as CVE-2026-22222.|"
+    "310|mention|example/repo|35|Issue||Loader crash|stranger|@cgwalters-bot take a look|https://github.com/example/repo/issues/35#issuecomment-310||bug,kind/Security"
+    # An alert link in the text, and words across a line break.
+    "311|mention|example/repo|36|Issue||Lint|stranger|@cgwalters-bot is [this](https://github.com/example/repo/security/code-scanning) real?|https://github.com/example/repo/issues/36#issuecomment-311"
+    "312|mention|example/repo|37|Issue||Release notes|cgwalters|@cgwalters-bot draft the security\nadvisory text|https://github.com/example/repo/issues/37#issuecomment-312"
+    # Other ids and words, and Unicode hyphens.
+    "315|mention|example/repo|40|Issue||Parser|stranger|@cgwalters-bot is CVE‑2026‑55555 in this?|https://github.com/example/repo/issues/40#issuecomment-315"
+    "316|mention|example/repo|41|Issue||Deps|cgwalters|@cgwalters-bot bump it for PYSEC-2026-12|https://github.com/example/repo/issues/41#issuecomment-316"
+    "317|mention|example/repo|42|Issue||Parser|stranger|@cgwalters-bot there is a public exploit|https://github.com/example/repo/issues/42#issuecomment-317"
+    # Not an id: GO-... only at a word's start.
+    "318|mention|example/repo|43|Issue||Nightly|stranger|@cgwalters-bot cargo-2025-03-10 breaks the build|-"
+    # Not routed (not a ping), so not held for its title either.
+    "313|subscribed|example/repo|38|Issue||Fix CVE-2026-33333|stranger|LGTM|-"
 )
 echo '{"visibility": "private"}' | api repos/secret/repo
 held_want=("https://github.com/${COORD}/issues/3")
 for c in "${SECURITY_CASES[@]}"; do
-    IFS='|' read -r id reason repo n type surl title author body held <<<"${c}"
+    IFS='|' read -r id reason repo n type surl title author body held ibody labels <<<"${c}"
     test "${held}" = - || held_want+=("${held}")
     if test -n "${n}"; then
         surl=https://api.github.com/repos/${repo}/issues/${n}
-        jq -n --arg r "${repo}" --arg n "${n}" --arg t "${title}" '{number: ($n | tonumber), title: $t,
-            html_url: "https://github.com/\($r)/issues/\($n)", labels: [], body: ""}' | api "repos/${repo}/issues/${n}"
+        jq -n --arg r "${repo}" --arg n "${n}" --arg t "${title}" --arg b "${ibody}" --arg l "${labels}" '{number: ($n | tonumber),
+            title: $t, html_url: "https://github.com/\($r)/issues/\($n)", body: $b,
+            labels: ($l | split(",") | map({name: .}))}' | api "repos/${repo}/issues/${n}"
         jq -n --arg r "${repo}" --arg n "${n}" --arg id "${id}" --arg a "${author}" --arg b "${body}" '[{id: ($id | tonumber),
-            user: {login: $a, type: "User"}, body: $b, created_at: "2026-09-26T10:00:00Z", updated_at: "2026-09-26T10:00:00Z",
+            user: {login: $a, type: "User"}, body: ($b | gsub("\\\\n"; "\n")), created_at: "2026-09-26T10:00:00Z", updated_at: "2026-09-26T10:00:00Z",
             html_url: "https://github.com/\($r)/issues/\($n)#issuecomment-\($id)"}]' | api "repos/${repo}/issues/${n}/comments"
     fi
     jq -nc --arg id "${id}" --arg reason "${reason}" --arg repo "${repo}" --arg type "${type}" --arg url "${surl}" \
@@ -301,14 +322,16 @@ grep -q "would file: Mention: @jmarrero-bot on example/repo#6" <<<"${out}" ||
     fail "jmarrero-bot's mention outside the coordination repository wasn't filed:"$'\n'"${out}"
 grep -q "would file: Mention: @stranger on example/repo#33" <<<"${out}" ||
     fail "a ping about the security docs wasn't filed:"$'\n'"${out}"
-test "$(grep -c "would file" <<<"${out}")" -eq 4 || fail "filed more than those four:"$'\n'"${out}"
+grep -q "would file: Mention: @stranger on example/repo#43" <<<"${out}" ||
+    fail "a ping naming a nightly toolchain wasn't filed:"$'\n'"${out}"
+test "$(grep -c "would file" <<<"${out}")" -eq 5 || fail "filed more than those five:"$'\n'"${out}"
 # Every security-related ping is held, with its URL only, and nothing
 # else is.
 held_got=$(sed -n 's/^security //p' <<<"${out}" | jq -r 'if keys == ["type", "url"] and .type == "security" then .url
     else error("not a security record: \(tojson)") end' | sort) || fail "bad security records:"$'\n'"${out}"
 test "${held_got}" = "$(printf '%s\n' "${held_want[@]}" | sort)" ||
     fail "held ${held_got:-nothing}, not:"$'\n'"$(printf '%s\n' "${held_want[@]}")"$'\n'"${out}"
-grep -q "7 new security-related pings held" <<<"${out}" || fail "the held pings weren't counted right:"$'\n'"${out}"
+grep -q "${#held_want[@]} new security-related pings held" <<<"${out}" || fail "the held pings weren't counted right:"$'\n'"${out}"
 # The held pings' threads and comments are in no other record.
 for url in "${held_want[@]}"; do
     if grep -F "${url}" <<<"${records}" >/dev/null; then

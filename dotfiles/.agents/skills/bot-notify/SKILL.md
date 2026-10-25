@@ -35,11 +35,13 @@ comments on those (`Gist comment on GIST_URL` in the output). Each
 trigger is routed as follows:
 
 - **Anything security-related**, from anyone, the operator included: a
-  security alert or advisory notification, an advisory URL, or a CVE or
-  GHSA id or words like "security advisory", "vulnerability" or
-  "embargo" in its title or text. It is held: never filed, answered or
-  put on the board, and kept out of the board's state; only a
-  `security` record with its URL is printed, by every run until
+  security alert or advisory notification, anything in an advisory's
+  temporary private fork (`OWNER/REPO-ghsa-...`), an advisory or alert
+  URL (in the text too), a label like `security`, or a CVE or GHSA id or
+  words like "security advisory", "exploit" or "embargo" in its
+  title, the issue's body or the comment. It is held: never filed,
+  answered or put on the board, and kept out of the board's state; only
+  a `security` record with its URL is printed, by every run until
   `bot-notify ack URL`. Tell the operator about it in the interactive
   session only, never anywhere public, then ack it.
 - **An assignment by the operator login**, as recorded by GitHub (the `actor` of
