@@ -16,6 +16,9 @@
 # And security-related pings, which are held, whoever wrote them: never
 # filed, nor a request or coordination question, only a 'security'
 # record with the URL (a table of cases, below).
+# And a thread GitHub has read after his asks there (something other
+# than bot-notify read it): they are still requests, and one acked
+# before isn't printed again.
 #   tests/bot-notify-route.sh
 set -euo pipefail
 
@@ -76,9 +79,11 @@ api() { # api PATH: stdin becomes the answer to 'gh api PATH'
 
 echo '{"login": "cgwalters-bot"}' | api user
 # bot-board state-get reads the state item with one GraphQL query.
-# #22's labeling was triaged (acked) already.
+# #22's labeling was triaged (acked) already, and so was a request on
+# example/repo#50.
 jq -n --arg t "${TRACKER}" --arg now "$(date -u +%FT%TZ)" '{since: "2026-09-26T00:00:00Z",
-    acked: {"https://github.com/\($t)/issues/22#event-901": $now}} | tojson as $state
+    acked: {"https://github.com/\($t)/issues/22#event-901": $now,
+            "https://github.com/example/repo/issues/50#issuecomment-5002": $now}} | tojson as $state
     | {data: {node: {id: "PVTI_lADOE9oHIs4BlJLczg9kJYo", isArchived: true,
        content: {id: "DI_lADOE9oHIs4BlJLczgLPK1o", title: "bot-state: notifications",
                  body: "state\n\n```json\n\($state)\n```\n"}}}}' | api graphql
@@ -196,6 +201,19 @@ jq -n '[{id: 16, user: {login: "jmarrero-bot", type: "User"}, body: "@cgwalters-
     created_at: "2026-09-26T10:16:00Z", updated_at: "2026-09-26T10:16:00Z",
     html_url: "https://github.com/example/repo/issues/6#issuecomment-16"}]' | api repos/example/repo/issues/6/comments
 
+# example/repo#50: his issue and his comment ask the bot something;
+# he acked another ask there already. Recent, since triggers before the
+# acks kept (30 days) are never looked at again.
+asked_at=$(date -u -d '2 hours ago' +%FT%TZ)
+read_at=$(date -u -d '1 hour ago' +%FT%TZ)
+jq -n --arg at "${asked_at}" '{number: 50, title: "New network", html_url: "https://github.com/example/repo/issues/50", labels: [],
+    body: "@cgwalters-bot what is your local IP address?", user: {login: "cgwalters", type: "User"},
+    created_at: $at}' | api repos/example/repo/issues/50
+jq -n --arg at "${asked_at}" '[[5001, "@cgwalters-bot are you alive?"], [5002, "@cgwalters-bot ping"]]
+    | map({id: .[0], user: {login: "cgwalters", type: "User"}, body: .[1], created_at: $at,
+           updated_at: $at, html_url: "https://github.com/example/repo/issues/50#issuecomment-\(.[0])"})' |
+    api repos/example/repo/issues/50/comments
+
 # thread ID REASON REPO NUMBER [TYPE]
 thread() {
     jq -nc --arg id "$1" --arg reason "$2" --arg repo "$3" --arg n "$4" --arg type "${5:-Issue}" '{id: $id,
@@ -214,6 +232,9 @@ thread() {
     thread 107 author "${TRACKER}" 11
     thread 108 mention "${COORD}" 2
     thread 109 mention example/repo 6
+    # Read on GitHub after his asks, and not updated since.
+    thread 110 mention example/repo 50 |
+        jq -c --arg u "${asked_at}" --arg r "${read_at}" '.unread = false | .updated_at = $u | .last_read_at = $r'
 } | jq -s . >"${WORK}/threads.json"
 
 # Security-related pings, one per line: THREAD_ID|REASON|REPO|NUMBER|TYPE|
@@ -288,7 +309,7 @@ out=$("${BIN}/bot-notify" --dry-run --from-file "${WORK}/threads.json" 2>"${WORK
     fail "bot-notify failed: $(cat "${WORK}/err")"$'\n'"${out}"
 records=$(sed -n 's/^\(answer\|request\|coordination\) //p' <<<"${out}")
 
-jq -se 'length == 10' <<<"${records}" >/dev/null || fail "expected 10 records, got:"$'\n'"${records}"
+jq -se 'length == 12' <<<"${records}" >/dev/null || fail "expected 12 records, got:"$'\n'"${records}"
 jq -se 'any(.[]; .type == "answer" and .thread_id == "107" and .choice == null)' \
     <<<"${records}" >/dev/null || fail "his comment on a chore isn't an answer:"$'\n'"${records}"
 jq -se 'any(.[]; .type == "answer" and .reason == "mention" and .thread_id == "106" and .choice == null)' \
@@ -365,6 +386,14 @@ grep -q "request https://github.com/${TRACKER}/issues/22#event-901 already acked
     fail "#22's acked labeling came back:"$'\n'"${out}"
 grep -q "and 2 issues labelled needs-triage:" <<<"${out}" ||
     fail "the issues to triage weren't counted right:"$'\n'"${out}"
+# Read on GitHub is not routed: both of his asks on #50 are requests, and
+# the one acked before stays acked.
+test "$(jq -sr '[.[] | select(.thread_id == "110") | .url] | sort | join(" ")' <<<"${records}")" = \
+    "https://github.com/example/repo/issues/50 https://github.com/example/repo/issues/50#issuecomment-5001" ||
+    fail "his asks in a thread GitHub has read aren't requests:"$'\n'"${out}"
+grep -q "request https://github.com/example/repo/issues/50#issuecomment-5002 already acked" <<<"${out}" ||
+    fail "the acked ask on #50 came back:"$'\n'"${out}"
 echo "ok: tracker answers and requests routed; the bot's own and others' comments ignored"
+echo "ok: asks in a thread GitHub has read are still requests, once"
 echo "ok: coordination questions routed as such, never as requests; cgwalters' still requests, others' filed"
 echo "ok: security-related pings held with their URL only, whoever wrote them; a normal ping still filed"

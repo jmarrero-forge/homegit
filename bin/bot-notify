@@ -276,7 +276,10 @@ ${coordination}  - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} ment
 
 Threads in ${FORGE_ORG} other than ${TRACKER_REPO}${COORDINATION_REPO:+ and ${COORDINATION_REPO}} are skipped: 'bot-pr
 inbox' covers them. Other threads are marked read once routed, unless
-they hold unacked requests.
+they hold unacked requests. A thread GitHub has read is routed all the
+same (anything can mark it read, the web UI, say): its triggers since an
+hour before the last poll are looked at again, and those routed before
+are known by their URL.
 The poll state (since, Last-Modified, and the gist check's since and
 ETags) and the unacked requests are kept in the archived
 'bot-state: ${STATE_NAME}' draft item on the public board,
@@ -844,6 +847,11 @@ event_hits() {
 # How far back the safety net looks, and where a coordination thread
 # never read before starts.
 window=$(date -u -d "@$(($(date -u -d "${since}" +%s) - SAFETY_LOOKBACK_SECS))" +%FT%TZ)
+# Where a thread's triggers are looked at again from, whatever GitHub's
+# last read says (see triggers): the window, but never before the acks
+# kept, which tell a trigger routed before from a new one.
+rescan_from=${window}
+[[ "${rescan_from}" > "${acked_cutoff}" ]] || rescan_from=${acked_cutoff}
 
 # safety_threads: prints a JSON array of threads for what the safety net
 # found that isn't in THREADS already, and for every issue and PR in
@@ -902,7 +910,13 @@ excerpt_jq="(. // \"\" | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} th
 
 # triggers THREAD: prints one JSON object per new trigger in the thread:
 # {author, author_type, url, body, located}. Nothing if the thread has no
-# trigger newer than its last read; fails if GitHub can't be read.
+# trigger newer than its last read, as far as it counts; fails if GitHub
+# can't be read. GitHub's last read only counts up to rescan_from:
+# anything can mark a thread read (the web UI, another client of the
+# bot's account, or this script, marking read a thread that was updated
+# after the poll), so the triggers since then are looked at again, and
+# those routed before are known by their URL (acked, pending, filed or
+# held).
 triggers() {
     local thread=$1 reason type subject_url latest last_read repo number self=true
     reason=$(jq -r .reason <<<"${thread}")
@@ -915,6 +929,9 @@ triggers() {
     subject_url=$(jq -r '.subject.url // empty' <<<"${thread}")
     latest=$(jq -r '.subject.latest_comment_url // empty' <<<"${thread}")
     last_read=$(jq -r '.last_read_at // empty' <<<"${thread}")
+    if test -n "${last_read}" && [[ "${last_read}" > "${rescan_from}" ]]; then
+        last_read=${rescan_from}
+    fi
     repo=$(jq -r .repository.full_name <<<"${thread}")
     local found='' issue html
     if [[ "${type}" =~ ^(Issue|PullRequest)$ ]] && [[ "${subject_url}" =~ /([0-9]+)$ ]]; then
@@ -1437,11 +1454,8 @@ while IFS= read -r thread; do
     test -n "${thread}" || continue
     id=$(jq -r .id <<<"${thread}")
     desc=$(jq -r '"\(.reason) in \(.repository.full_name): \(.subject.title // .id) [\(if .source then "found in \(.source)" else "thread \(.id)" end)]"' <<<"${thread}")
-    # Already routed (only this script reads the bot's notifications), and
-    # not updated since.
-    if jq -e '.unread == false and .last_read_at != null and .last_read_at >= .updated_at' <<<"${thread}" >/dev/null; then
-        continue
-    fi
+    # Routed even if GitHub has it read: that says nothing about whether
+    # this script saw its triggers (see triggers).
     nselected=$((nselected + 1))
     # Held as a whole, without reading it, wherever it is.
     if is_security .security "${thread}"; then
